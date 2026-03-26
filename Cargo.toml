@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bitcord-core",
+    "crates/bitcord-node",
+    "crates/bitcord-tauri",
+]

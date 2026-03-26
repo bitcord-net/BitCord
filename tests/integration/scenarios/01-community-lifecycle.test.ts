@@ -1,0 +1,160 @@
+/**
+ * Scenario 01 — Community lifecycle
+ *
+ * Tests the full community create → join → channel create → delete flow using
+ * two spawned `bitcord-node` processes communicating over localhost TCP.
+ *
+ * Port allocation:
+ *   Node A: api=7401
+ *   Node B: api=7411
+ */
+
+import { describe, it, beforeAll, afterAll } from "vitest";
+import { NodeProcess } from "../helpers/NodeProcess.js";
+import { BitCordTestClient } from "../helpers/BitCordTestClient.js";
+import { TestLogger, pollUntil } from "../helpers/TestLogger.js";
+
+describe("community lifecycle", () => {
+  let nodeA: NodeProcess;
+  let nodeB: NodeProcess;
+  let clientA: BitCordTestClient;
+  let clientB: BitCordTestClient;
+  const logger = new TestLogger("community-lifecycle");
+
+  beforeAll(async () => {
+    nodeA = new NodeProcess({ label: "node-a", apiPort: 7401 });
+    await nodeA.start();
+    nodeB = new NodeProcess({ label: "node-b", apiPort: 7411 });
+    await nodeB.start();
+
+    clientA = new BitCordTestClient(nodeA.apiUrl);
+    await clientA.connectAndWait(5_000);
+    clientB = new BitCordTestClient(nodeB.apiUrl);
+    await clientB.connectAndWait(5_000);
+  });
+
+  afterAll(async () => {
+    logger.addNodeLogs(nodeA.logBuffer);
+    logger.addNodeLogs(nodeB.logBuffer);
+    logger.writeReport();
+
+    clientA.close();
+    clientB.close();
+    await nodeA.stop();
+    await nodeB.stop();
+  });
+
+  it("creates a community on node A", async () => {
+    const community = await logger.step("community_create", () =>
+      clientA.communityCreate({
+        name: "Test Community",
+        description: "Integration test",
+        seed_nodes: [],
+      })
+    );
+    // Store for later steps via module-level variable (vitest shares describe scope).
+    (globalThis as Record<string, unknown>).__testCommunity = community;
+  });
+
+  it("node A gets a listen address", async () => {
+    const info = await logger.step("node_get_local_addrs", () =>
+      pollUntil(
+        async () => {
+          const data = await clientA.nodeGetLocalAddrs();
+          // Accept both libp2p-style multiaddrs (/tcp/) and QUIC IP:port addresses.
+          const addr =
+            data.listen_addrs.find(
+              (a) =>
+                !a.includes("0.0.0.0") &&
+                !a.includes("::") &&
+                !a.includes("127.0.0.1") &&
+                !a.includes("[::1]")
+            ) ?? data.listen_addrs.find((a) => a.length > 0);
+          return addr ?? null;
+        },
+        5_000
+      )
+    );
+    (globalThis as Record<string, unknown>).__seedAddr = info;
+  });
+
+  it("node B joins via invite and receives the manifest", async () => {
+    const community = (globalThis as Record<string, unknown>).__testCommunity as Record<
+      string,
+      unknown
+    >;
+    const seedAddr = (globalThis as Record<string, unknown>).__seedAddr as string;
+
+    const invitePayload = JSON.stringify({
+      community_id: community["id"],
+      name: community["name"],
+      description: "Integration test",
+      seed_nodes: [seedAddr],
+      public_key_hex: community["public_key_hex"],
+    });
+    const invite = Buffer.from(invitePayload).toString("base64url");
+
+    await logger.step(
+      "community_join",
+      () => clientB.communityJoin(invite),
+      { community_id: String(community["id"]) }
+    );
+  });
+
+  it("creates a channel on node A", async () => {
+    const community = (globalThis as Record<string, unknown>).__testCommunity as Record<
+      string,
+      unknown
+    >;
+
+    const channel = await logger.step("channel_create", () =>
+      clientA.channelCreate({
+        community_id: community["id"],
+        name: "general",
+        kind: "text",
+      })
+    );
+    (globalThis as Record<string, unknown>).__testChannel = channel;
+  });
+
+  it("node B sees the channel after P2P sync", async () => {
+    const community = (globalThis as Record<string, unknown>).__testCommunity as Record<
+      string,
+      unknown
+    >;
+    const channel = (globalThis as Record<string, unknown>).__testChannel as Record<
+      string,
+      unknown
+    >;
+
+    await logger.step("channel_sync_b", () =>
+      pollUntil(async () => {
+        const channels = await clientB.channelList(String(community["id"]));
+        return channels.find((c) => c["id"] === channel["id"]) ?? null;
+      }, 15_000)
+    );
+  });
+
+  it("deletes the channel on node A", async () => {
+    const community = (globalThis as Record<string, unknown>).__testCommunity as Record<
+      string,
+      unknown
+    >;
+    const channel = (globalThis as Record<string, unknown>).__testChannel as Record<
+      string,
+      unknown
+    >;
+
+    await logger.step("channel_delete", () =>
+      clientA.channelDelete({
+        community_id: community["id"],
+        channel_id: channel["id"],
+      })
+    );
+
+    const remaining = await clientA.channelList(String(community["id"]));
+    if (remaining.some((c) => c["id"] === channel["id"])) {
+      throw new Error("Deleted channel still appears in channel list");
+    }
+  });
+});

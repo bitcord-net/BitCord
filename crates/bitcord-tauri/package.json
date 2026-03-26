@@ -1,0 +1,8 @@
+{
+  "name": "bitcord-tauri-gradle-proxy",
+  "description": "Proxy package.json for Tauri Android Gradle build",
+  "private": true,
+  "scripts": {
+    "tauri": "node ../../app/node_modules/@tauri-apps/cli/tauri.js"
+  }
+}

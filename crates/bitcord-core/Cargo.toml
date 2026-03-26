@@ -1,0 +1,78 @@
+[package]
+name = "bitcord-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["BitCord Contributors"]
+description = "Core library for the BitCord encrypted P2P communication platform"
+license = "MIT"
+repository = "https://github.com/bitcord-net/BitCord"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptographic Identity
+ed25519-dalek = { version = "2", features = ["rand_core", "serde", "pkcs8"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+bs58 = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Community & Channel Data Model
+chrono = { version = "0.4", features = ["serde"] }
+ulid = { version = "1", features = ["serde"] }
+
+# QUIC Transport
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+pkcs8 = "0.10"
+postcard = { version = "1", features = ["alloc"] }
+
+directories = "5"
+
+# Network interface enumeration (for expanding 0.0.0.0 in invite links)
+if-addrs = "0.13"
+
+# NAT traversal — UPnP IGD port mapping
+igd = { version = "0.12", features = ["aio"] }
+
+# Persistent Node Storage
+redb = "2"
+
+# Resource Management & Node Configuration
+byte-unit = "5"
+sysinfo = "0.32"
+governor = "0.6"
+toml = "0.8"
+
+# Argon2id key derivation for keystore
+argon2 = "0.5"
+
+# Internal API Bridge
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+jsonrpsee = { version = "0.24", features = ["server"] }
+http = "1"
+
+[features]
+lan-discovery = []
+
+[dev-dependencies]
+tempfile = "3"
+jsonrpsee = { version = "0.24", features = ["ws-client"] }
+postcard = { version = "1", features = ["alloc"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+quinn = "0.11"

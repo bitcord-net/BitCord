@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bc-base: #0b0d0f;
+  --color-bc-surface-1: #1e2124;
+  --color-bc-surface-2: #282b30;
+  --color-bc-surface-3: #36393f;
+  --color-bc-surface-hover: #32353b;
+  --color-bc-text: #dcddde;
+  --color-bc-muted: #8e9297;
+  --color-bc-accent: #5865f2;
+  --color-bc-accent-hover: #4752c4;
+  --color-bc-success: #3ba55c;
+  --color-bc-warning: #faa61a;
+  --color-bc-danger: #ed4245;
+}
+
+/* ── Light theme overrides ────────────────────────────────────────── */
+[data-theme="light"] {
+  --color-bc-base: #f2f3f5;
+  --color-bc-surface-1: #ffffff;
+  --color-bc-surface-2: #f2f3f5;
+  --color-bc-surface-3: #e3e5e8;
+  --color-bc-surface-hover: #ebedef;
+  --color-bc-text: #2e3338;
+  --color-bc-muted: #747f8d;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--color-bc-base);
+  color: var(--color-bc-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.375;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Focus ring ───────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--color-bc-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-bc-surface-3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-bc-muted);
+}
+
+/* ── Message body markdown ─────────────────────────────────────── */
+.message-body {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.message-body p {
+  margin: 0 0 0.25rem;
+}
+
+.message-body p:last-child {
+  margin-bottom: 0;
+}
+
+.message-body code {
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  font-size: 0.875em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.message-body pre {
+  background: var(--color-bc-surface-1);
+  border-radius: 4px;
+  padding: 0.625rem 0.875rem;
+  margin: 4px 0;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.message-body pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.message-body blockquote {
+  border-left: 3px solid var(--color-bc-muted);
+  margin: 4px 0;
+  padding-left: 0.75rem;
+  color: var(--color-bc-muted);
+}
+
+.message-body ul,
+.message-body ol {
+  margin: 2px 0;
+  padding-left: 1.5rem;
+}
+
+.message-body a {
+  color: var(--color-bc-accent);
+  text-decoration: none;
+}
+
+.message-body a:hover {
+  text-decoration: underline;
+}

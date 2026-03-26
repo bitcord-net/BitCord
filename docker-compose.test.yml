@@ -1,0 +1,74 @@
+version: "3.9"
+
+# Integration test composition: two bitcord-node instances + a Node.js test runner.
+# Run with:
+#   docker compose -f docker-compose.test.yml up --abort-on-container-exit
+
+services:
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command:
+      - "--api-port=7401"
+      - "--api-bind=0.0.0.0"
+      - "--log-level=info"
+    environment:
+      BITCORD_PASSPHRASE: ""
+      BITCORD_TEST_MODE: "1"
+      # Write data to a volume so node-a persists its identity across restarts.
+    volumes:
+      - node-a-data:/data
+    ports:
+      - "7401:7401"  # API
+      - "7402:7402"  # P2P (configured via config.toml written at startup)
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7401"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command:
+      - "--api-port=7411"
+      - "--api-bind=0.0.0.0"
+      - "--log-level=info"
+    environment:
+      BITCORD_PASSPHRASE: ""
+      BITCORD_TEST_MODE: "1"
+    volumes:
+      - node-b-data:/data
+    ports:
+      - "7411:7411"  # API
+      - "7412:7412"  # P2P
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7411"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  test-runner:
+    image: node:22-slim
+    working_dir: /tests
+    volumes:
+      - ./tests/integration:/tests
+      - ./test-results:/tests/test-results
+    environment:
+      # Point the TypeScript client directly at the Docker node containers.
+      NODE_A_URL: "ws://node-a:7401"
+      NODE_B_URL: "ws://node-b:7411"
+      # Skip binary spawning — use external nodes instead.
+      BITCORD_DOCKER_MODE: "1"
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+    command: ["sh", "-c", "npm install && npm test"]
+
+volumes:
+  node-a-data:
+  node-b-data:

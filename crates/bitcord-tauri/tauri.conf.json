@@ -1,0 +1,38 @@
+{
+  "productName": "BitCord",
+  "version": "0.1.0",
+  "identifier": "net.bitcord.client",
+  "build": {
+    "frontendDist": "../../app/dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "BitCord",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ws: http:; img-src 'self' data: blob:"
+    }
+  },  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ]
+  },
+  "plugins": {
+    "dialog": null,
+    "notification": null
+  }
+}

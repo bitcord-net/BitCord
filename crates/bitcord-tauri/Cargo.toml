@@ -1,0 +1,39 @@
+[package]
+name = "bitcord-tauri"
+version = "0.1.0"
+edition = "2024"
+authors = ["BitCord Contributors"]
+description = "Tauri desktop application for the BitCord encrypted P2P communication platform"
+license = "MIT"
+repository = "https://github.com/bitcord-net/BitCord"
+
+[lib]
+name = "bitcord_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "bitcord-tauri"
+path = "src/main.rs"
+
+[dependencies]
+bitcord-core = { path = "../bitcord-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+bs58 = "0.5"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+postcard = { version = "1", features = ["alloc"] }
+tauri-plugin-single-instance = "2.4.0"
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "windows-native", "apple-native"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

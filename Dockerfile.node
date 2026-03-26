@@ -1,0 +1,33 @@
+# ── Builder stage ─────────────────────────────────────────────────────────────
+FROM rust:1-slim-bookworm AS builder
+
+WORKDIR /app
+
+# Install system dependencies for libp2p (OpenSSL, pkg-config).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace manifests first for better layer caching.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# Build only the headless node binary in release mode.
+RUN cargo build --release -p bitcord-node
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/bitcord-node /usr/local/bin/bitcord-node
+
+# Default API port and P2P port (override via docker-compose or -e flags).
+EXPOSE 7331 7332
+
+ENTRYPOINT ["bitcord-node"]
