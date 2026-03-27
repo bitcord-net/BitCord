@@ -488,19 +488,25 @@ export function MessageBubble({
         display: "flex",
         padding: `${paddingTop} 1rem 2px`,
         gap: "1rem",
-        background: isHighlighted
-          ? undefined
-          : hovered
-          ? "rgba(4,4,5,0.07)"
-          : "transparent",
-        animation: isHighlighted ? "bc-msg-flash 1s ease-out forwards" : undefined,
+        background: hovered ? "rgba(4,4,5,0.07)" : "transparent",
         position: "relative",
-        transition: isHighlighted ? undefined : "background 0.05s",
+        transition: "background 0.05s",
         opacity: message._status === "pending" ? 0.65 : 1,
       }}
       role="article"
       aria-label={`Message from ${displayName}`}
     >
+      {isHighlighted && (
+        <div
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            inset: 0,
+            animation: "bc-msg-flash 1s ease-out forwards",
+            pointerEvents: "none",
+          }}
+        />
+      )}
       {/* Avatar column */}
       <div style={{ width: "40px", flexShrink: 0, paddingTop: isGrouped ? 0 : "2px" }}>
         {!isGrouped ? (

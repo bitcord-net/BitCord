@@ -152,12 +152,22 @@ function DmMessageBubble({
         gap: "0.625rem",
         padding: isGrouped ? "1px 1rem 2px" : "0.5rem 1rem 2px",
         opacity: isPending ? 0.6 : 1,
-        background: isHighlighted ? undefined : hovered ? "rgba(255,255,255,0.02)" : "transparent",
-        animation: isHighlighted ? "bc-msg-flash 1s ease-out forwards" : undefined,
-        transition: isHighlighted ? undefined : "background 0.05s",
+        background: hovered ? "rgba(255,255,255,0.02)" : "transparent",
+        transition: "background 0.05s",
         position: "relative",
       }}
     >
+      {isHighlighted && (
+        <div
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            inset: 0,
+            animation: "bc-msg-flash 1s ease-out forwards",
+            pointerEvents: "none",
+          }}
+        />
+      )}
       {/* Avatar column */}
       <div style={{ width: "36px", flexShrink: 0 }}>
         {!isGrouped && (
@@ -563,7 +573,7 @@ export function DMConversationView() {
   const handleScrollToMessage = useCallback((messageId: string) => {
     const el = listRef.current?.querySelector<HTMLElement>(`[data-msg-id="${messageId}"]`);
     if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.scrollIntoView({ behavior: "instant", block: "center" });
     if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
     setHighlightedId(messageId);
     highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1000);
@@ -630,7 +640,7 @@ export function DMConversationView() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-      <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} } @keyframes bc-msg-flash { 0% { background: transparent; } 15% { background: rgba(88,101,242,0.45); } 60% { background: rgba(88,101,242,0.45); } 100% { background: transparent; } }`}</style>
+      <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
       {/* Header */}
       <div
         style={{

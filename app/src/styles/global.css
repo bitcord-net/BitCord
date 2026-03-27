@@ -66,11 +66,19 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-bc-surface-3);
+  background: rgba(128, 128, 128, 0.4);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-bc-muted);
+  background: rgba(128, 128, 128, 0.65);
+}
+
+/* ── Message highlight flash ───────────────────────────────────── */
+@keyframes bc-msg-flash {
+  0%   { background: transparent; }
+  15%  { background: rgba(88, 101, 242, 0.45); }
+  60%  { background: rgba(88, 101, 242, 0.45); }
+  100% { background: transparent; }
 }
 
 /* ── Message body markdown ─────────────────────────────────────── */

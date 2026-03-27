@@ -48,6 +48,7 @@ export function MessageList({
   const parentRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
   const prevCountRef = useRef(0);
+  const prevLastIdRef = useRef<string | null>(null);
   const loadingMoreRef = useRef(false);
   const [newCount, setNewCount] = useState(0);
   const [showJumpButton, setShowJumpButton] = useState(false);
@@ -87,15 +88,19 @@ export function MessageList({
     measureElement: (el) => el.getBoundingClientRect().height,
   });
 
-  // Scroll to bottom on channel first load
+  // Scroll to bottom on channel first load / channel switch
   useEffect(() => {
+    // Reset tracking refs immediately so the items.length effect below doesn't
+    // miscount the initial batch of messages as "new".
+    prevCountRef.current = 0;
+    prevLastIdRef.current = null;
+    atBottomRef.current = true;
     if (items.length > 0) {
       setTimeout(() => {
         virtualizer.scrollToIndex(items.length - 1, {
           align: "end",
           behavior: "instant",
         });
-        atBottomRef.current = true;
         setShowJumpButton(false);
         setNewCount(0);
       }, 0);
@@ -107,21 +112,30 @@ export function MessageList({
   // Auto-scroll when new messages arrive (if at bottom)
   useEffect(() => {
     const count = items.length;
+    const lastId = items[count - 1]?.message.id ?? null;
+
     if (count > prevCountRef.current) {
       const added = count - prevCountRef.current;
-      if (atBottomRef.current) {
-        setTimeout(() => {
-          virtualizer.scrollToIndex(count - 1, {
-            align: "end",
-            behavior: "smooth",
-          });
-        }, 0);
-      } else {
-        setNewCount((n) => n + added);
-        setShowJumpButton(true);
+      // Only treat as "new" if a message was appended at the bottom.
+      // When onLoadMore prepends old messages, the last message ID stays the same.
+      const appendedAtBottom = lastId !== prevLastIdRef.current;
+      if (appendedAtBottom) {
+        if (atBottomRef.current) {
+          setTimeout(() => {
+            virtualizer.scrollToIndex(count - 1, {
+              align: "end",
+              behavior: "smooth",
+            });
+          }, 0);
+        } else {
+          setNewCount((n) => n + added);
+          setShowJumpButton(true);
+        }
       }
     }
+
     prevCountRef.current = count;
+    prevLastIdRef.current = lastId;
   }, [items.length, virtualizer]);
 
   // Auto-scroll when the last message grows (e.g. a reaction is added) and user is at the bottom
@@ -175,10 +189,17 @@ export function MessageList({
   const handleScrollToMessage = useCallback((messageId: string) => {
     const idx = items.findIndex((item) => item.message.id === messageId);
     if (idx === -1) return;
-    virtualizer.scrollToIndex(idx, { align: "center", behavior: "smooth" });
+    virtualizer.scrollToIndex(idx, { align: "center", behavior: "instant" });
     if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-    setHighlightedId(messageId);
-    highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1000);
+    // Double-RAF: the virtualizer updates its internal scroll state asynchronously
+    // via the scroll event. Two frames ensures it has re-rendered with the new
+    // virtual items before we apply the highlight, so the target element exists in the DOM.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setHighlightedId(messageId);
+        highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1000);
+      });
+    });
   }, [items, virtualizer]);
 
   if (items.length === 0) {
@@ -343,12 +364,6 @@ export function MessageList({
         @keyframes spin {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
-        }
-        @keyframes bc-msg-flash {
-          0%   { background: transparent; }
-          15%  { background: rgba(88,101,242,0.45); }
-          60%  { background: rgba(88,101,242,0.45); }
-          100% { background: transparent; }
         }
       `}</style>
     </div>
