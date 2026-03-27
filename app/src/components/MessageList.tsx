@@ -136,7 +136,7 @@ export function MessageList({
 
     prevCountRef.current = count;
     prevLastIdRef.current = lastId;
-  }, [items.length, virtualizer]);
+  }, [items, virtualizer]);
 
   // Auto-scroll when the last message grows (e.g. a reaction is added) and user is at the bottom
   const lastItemReactionKey = items.length > 0
