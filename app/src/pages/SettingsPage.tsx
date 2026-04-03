@@ -877,7 +877,7 @@ function AboutTab() {
       <SectionHeader>Links</SectionHeader>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <a
-          href="https://github.com/bitcord/bitcord"
+          href="https://github.com/bitcord-net/BitCord"
           target="_blank"
           rel="noopener noreferrer"
           style={{ color: "var(--color-bc-accent)", fontSize: 14, textDecoration: "none" }}

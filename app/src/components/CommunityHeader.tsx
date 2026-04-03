@@ -11,15 +11,13 @@ interface Props {
   community: CommunityInfo;
 }
 
-function buildInviteLink(community: CommunityInfo, extraSeedNodes: string[]): string {
-  // Merge community seed nodes with the caller-supplied list; deduplicate.
-  const seedNodes = [...new Set([...community.seed_nodes, ...extraSeedNodes])];
+function buildInviteLink(community: CommunityInfo): string {
   const payload = JSON.stringify({
     community_id: community.id,
     name: community.name,
     description: community.description,
     public_key_hex: community.public_key_hex,
-    seed_nodes: seedNodes,
+    seed_nodes: community.seed_nodes,
   });
   // base64url encode
   const b64 = btoa(payload)
@@ -78,25 +76,11 @@ export function CommunityHeader({ community }: Props) {
         link = await rpcClient.communityGenerateInvite(community.id);
       } catch {
         // Fall back to unsigned invite if the RPC fails unexpectedly.
-        link = buildInviteLink(community, []);
+        link = buildInviteLink(community);
       }
     } else {
-      // Non-admins build an unsigned invite locally, enriched with local addrs.
-      let localAddrs: string[] = [];
-      try {
-        const info = await rpcClient.nodeGetLocalAddrs();
-        // Exclude loopback and wildcard addresses — they're useless on other machines.
-        localAddrs = info.listen_addrs.filter(
-          (a: string) =>
-            !a.startsWith("127.0.0.1:") &&
-            !a.startsWith("[::1]:") &&
-            !a.startsWith("0.0.0.0:") &&
-            !a.startsWith("[::]:")
-        );
-      } catch {
-        // If the RPC fails, fall back to community seed nodes only.
-      }
-      link = buildInviteLink(community, localAddrs);
+      // Non-admins build an unsigned invite using only the admin-specified seed nodes.
+      link = buildInviteLink(community);
     }
     try {
       await navigator.clipboard.writeText(link);
