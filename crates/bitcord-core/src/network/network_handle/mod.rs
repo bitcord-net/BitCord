@@ -1,6 +1,5 @@
 mod command;
 mod gossip;
-mod kademlia;
 mod push_reader;
 mod reconnect;
 mod types;
@@ -12,7 +11,7 @@ use gossip::gossip_task;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::{identity::NodeIdentity, node::dht::Dht};
+use crate::identity::NodeIdentity;
 
 // ── NetworkHandle ─────────────────────────────────────────────────────────────
 
@@ -27,12 +26,17 @@ use crate::{identity::NodeIdentity, node::dht::Dht};
 /// `NetworkCommand::Dial` connects to a remote QUIC node using the provided
 /// TLS certificate fingerprint for certificate pinning.  When the fingerprint
 /// is all-zeros (`[0u8; 32]`) the connection operates in TOFU (Trust-On-First-Use)
-/// mode, accepting any certificate — this is used for DHT/bootstrap connections
+/// mode, accepting any certificate — this is used for bootstrap/mDNS connections
 /// where the fingerprint is not yet known.
 ///
 /// # Addressing
 /// `local_listen_addrs` (if non-empty) are emitted as `NetworkEvent::NewListenAddr`
 /// immediately after spawn so the application layer can populate invite links.
+///
+/// # DHT
+/// All DHT operations (Kademlia lookups, mailbox/community announcements) are
+/// performed directly through [`crate::dht::DhtHandle`] and never pass through
+/// this handle.
 pub struct NetworkHandle;
 
 impl NetworkHandle {
@@ -46,11 +50,9 @@ impl NetworkHandle {
         identity: Arc<NodeIdentity>,
         local_listen_addrs: Vec<String>,
         server_push_tx: Option<ServerPushTx>,
-        dht: Arc<Dht>,
     ) -> (mpsc::Sender<NetworkCommand>, mpsc::Receiver<NetworkEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
-        let evt_rx =
-            Self::spawn_with_channel(identity, local_listen_addrs, cmd_rx, server_push_tx, dht);
+        let evt_rx = Self::spawn_with_channel(identity, local_listen_addrs, cmd_rx, server_push_tx);
         (cmd_tx, evt_rx)
     }
 
@@ -61,7 +63,6 @@ impl NetworkHandle {
         local_listen_addrs: Vec<String>,
         cmd_rx: mpsc::Receiver<NetworkCommand>,
         server_push_tx: Option<ServerPushTx>,
-        dht: Arc<Dht>,
     ) -> mpsc::Receiver<NetworkEvent> {
         let (evt_tx, evt_rx) = mpsc::channel::<NetworkEvent>(512);
 
@@ -71,7 +72,6 @@ impl NetworkHandle {
             cmd_rx,
             evt_tx,
             server_push_tx,
-            dht,
         ));
 
         evt_rx

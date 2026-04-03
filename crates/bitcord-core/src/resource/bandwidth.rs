@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::interval;
-use tracing::debug;
+use tracing::trace;
 
 /// Cumulative byte counters and rolling rate estimates, updated every second.
 #[derive(Debug, Default)]
@@ -90,7 +90,7 @@ impl BandwidthLimiter {
                 let rate_in = (recv.saturating_sub(prev_recv)) * 8 / 1024;
                 stats.rate_out_kbps.store(rate_out, Ordering::Relaxed);
                 stats.rate_in_kbps.store(rate_in, Ordering::Relaxed);
-                debug!("bandwidth: out={rate_out} kbps  in={rate_in} kbps");
+                trace!("bandwidth: out={rate_out} kbps  in={rate_in} kbps");
                 prev_sent = sent;
                 prev_recv = recv;
             }

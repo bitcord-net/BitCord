@@ -1,17 +1,28 @@
 use anyhow::{Context, Result};
 use bitcord_core::{
     api::ApiServer,
-    config::NodeConfig,
+    config::{NodeConfig, NodeMode},
     identity::{NodeIdentity, keystore::KeyStore},
     network::NetworkCommand,
     node::{NodeInitConfig, init_node},
     resource::{bandwidth::BandwidthLimiter, metrics::MetricsUpdate, storage::StorageGuard},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::{path::PathBuf, sync::Arc};
-use tracing::info;
+use tracing::{info, warn};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
+
+/// Node operating mode.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CliMode {
+    /// No QUIC server, no DHT, no mDNS. Pure gossip receiver.
+    GossipClient,
+    /// Full peer: QUIC server + DHT + gossip relay.
+    Peer,
+    /// Headless seed: hosts communities, DM mailboxes, DHT. No user identity.
+    HeadlessSeed,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "bitcord-node", about = "BitCord headless P2P node")]
@@ -24,8 +35,12 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Run as a seed node
-    #[arg(long)]
+    /// Node operating mode
+    #[arg(long, value_enum)]
+    mode: Option<CliMode>,
+
+    /// [DEPRECATED] Run as a headless seed node. Use --mode headless-seed instead.
+    #[arg(long, hide = true)]
     seed: bool,
 
     /// Log level filter (trace, debug, info, warn, error)
@@ -68,9 +83,19 @@ async fn main() -> Result<()> {
         config.data_dir = dir.clone();
         config.identity_path = dir.join("identity.key");
     }
-    if args.seed {
-        config.is_seed_node = true;
+
+    // Resolve node mode: --mode takes precedence, then legacy --seed flag.
+    if let Some(mode) = args.mode {
+        config.node_mode = match mode {
+            CliMode::GossipClient => NodeMode::GossipClient,
+            CliMode::Peer => NodeMode::Peer,
+            CliMode::HeadlessSeed => NodeMode::HeadlessSeed,
+        };
+    } else if args.seed {
+        warn!("--seed is deprecated; use --mode headless-seed instead");
+        config.node_mode = NodeMode::HeadlessSeed;
     }
+
     if let Some(level) = args.log_level {
         config.log_level = level;
     }
@@ -79,8 +104,6 @@ async fn main() -> Result<()> {
     }
 
     // ── Init tracing ──────────────────────────────────────────────────────────
-    // When BITCORD_TEST_MODE=1, emit structured JSON logs for the TypeScript
-    // test runner to parse; otherwise use the human-readable default format.
     if std::env::var("BITCORD_TEST_MODE").is_ok() {
         tracing_subscriber::fmt()
             .json()
@@ -95,22 +118,19 @@ async fn main() -> Result<()> {
     info!(
         config = ?config_path,
         data_dir = ?config.data_dir,
-        seed_node = config.is_seed_node,
+        mode = ?config.node_mode,
         "BitCord node starting"
     );
 
-    if !config.is_seed_node {
-        tracing::warn!(
-            "This node is NOT running as a seed node. Data will be pruned \
-             when storage limits are reached and the node will not advertise \
-             itself as a bootstrap peer. To run as a seed node, restart with \
-             --seed or set is_seed_node = true in your config file."
-        );
-    }
-
     // ── Identity ──────────────────────────────────────────────────────────────
+    // HeadlessSeed nodes auto-generate an identity without prompting for a
+    // passphrase — they are meant to be run unattended.
     let passphrase_override = std::env::var("BITCORD_PASSPHRASE").ok();
-    let identity = load_or_create_identity(&config, passphrase_override.clone())?;
+    let identity = if config.node_mode == NodeMode::HeadlessSeed {
+        load_or_create_identity_headless(&config)?
+    } else {
+        load_or_create_identity(&config, passphrase_override.clone())?
+    };
     let identity = Arc::new(identity);
 
     let join_password = args.join_password.or_else(|| config.join_password.clone());
@@ -121,20 +141,27 @@ async fn main() -> Result<()> {
     // ── Init node (shared startup logic) ──────────────────────────────────────
     let result = init_node(NodeInitConfig {
         identity,
-        passphrase: passphrase_override,
+        passphrase: if config.node_mode == NodeMode::HeadlessSeed {
+            Some(String::new()) // empty passphrase for headless
+        } else {
+            passphrase_override
+        },
         config,
         config_path,
         join_password,
-        server_enabled: true,
         fallback_to_random_port: false,
         dht_self_addr: None, // resolved via NAT/STUN after binding
         store_db_path: state_dir.join("node.redb"),
     })
     .await?;
 
-    let quic_server = result.quic_server.expect("server_enabled=true");
-    let quic_task = result.quic_task.expect("server_enabled=true");
-    let cert_fingerprint_hex = result.cert_fingerprint_hex.expect("server_enabled=true");
+    let quic_server = result
+        .quic_server
+        .expect("Peer/HeadlessSeed mode must have QUIC server");
+    let quic_task = result
+        .quic_task
+        .expect("Peer/HeadlessSeed mode must have QUIC task");
+    let cert_fingerprint_hex = result.cert_fingerprint_hex.expect("cert always set");
 
     info!(
         addr = %quic_server.local_addr(),
@@ -147,7 +174,6 @@ async fn main() -> Result<()> {
     let bw_limiter = BandwidthLimiter::new(bandwidth_limit_kbps);
     BandwidthLimiter::spawn_stats_updater(bw_limiter.stats.clone());
 
-    // Wire bandwidth limiter stats into the metrics atomics returned from init.
     use std::sync::atomic::Ordering;
     result.bw_in.store(
         bw_limiter.stats.rate_in_kbps.load(Ordering::Relaxed),
@@ -158,14 +184,12 @@ async fn main() -> Result<()> {
         Ordering::Relaxed,
     );
 
-    // Seed disk usage into metrics.
     let _ = result
         .metrics_tx
         .send(MetricsUpdate::DiskUsageMb(
             storage_guard.used_bytes() / (1024 * 1024),
         ))
         .await;
-    // Keep the metrics sender alive so the task doesn't exit.
     let _metrics_tx = result.metrics_tx;
 
     // ── API server ────────────────────────────────────────────────────────────
@@ -207,10 +231,8 @@ async fn main() -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Load an existing identity or create a new one on first run.
-///
-/// If `passphrase_override` is `Some`, it is used directly without prompting —
-/// enabling unattended operation in tests and CI (set `BITCORD_PASSPHRASE=""`).
+/// Load an existing identity or create a new one.
+/// Prompts for passphrase interactively unless `passphrase_override` is set.
 fn load_or_create_identity(
     config: &NodeConfig,
     passphrase_override: Option<String>,
@@ -232,6 +254,26 @@ fn load_or_create_identity(
         let identity = NodeIdentity::generate();
         KeyStore::save(path, &identity, &passphrase).context("save new identity")?;
         info!("identity saved; peer ID = {}", identity.to_peer_id());
+        Ok(identity)
+    }
+}
+
+/// Load or auto-generate identity for HeadlessSeed mode (no passphrase prompt).
+fn load_or_create_identity_headless(config: &NodeConfig) -> Result<NodeIdentity> {
+    let path = &config.identity_path;
+    if path.exists() {
+        KeyStore::load(path, "").context("failed to load headless seed identity")
+    } else {
+        info!(
+            "no identity found at {:?} — auto-generating headless seed identity",
+            path
+        );
+        let identity = NodeIdentity::generate();
+        KeyStore::save(path, &identity, "").context("save headless seed identity")?;
+        info!(
+            "headless seed identity created; node address = {}",
+            identity.node_address()
+        );
         Ok(identity)
     }
 }

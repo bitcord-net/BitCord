@@ -1,14 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, info};
 
-use crate::{
-    identity::NodeIdentity,
-    network::{node_addr::NodeAddr, protocol::NodePush},
-    node::dht::Dht,
-};
+use crate::{identity::NodeIdentity, network::protocol::NodePush};
 
 use super::command::handle_command;
 use super::push_reader::push_reader;
@@ -22,13 +18,22 @@ pub(super) async fn gossip_task(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     evt_tx: mpsc::Sender<NetworkEvent>,
     server_push_tx: Option<ServerPushTx>,
-    dht: Arc<Dht>,
 ) {
     info!("NetworkHandle gossip task started");
 
-    // Emit local listen addresses so the app can build invite links.
-    for addr in local_listen_addrs {
-        let _ = evt_tx.send(NetworkEvent::NewListenAddr(addr)).await;
+    // Track own addresses (local listen + STUN-discovered) so we can detect
+    // and abort self-dials on self-hosted nodes.
+    let own_addrs: Arc<RwLock<std::collections::HashSet<String>>> =
+        Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+    // Emit local listen addresses so the app can build invite links, and seed
+    // own_addrs so LAN self-dials are caught before STUN discovery.
+    {
+        let mut addrs = own_addrs.write().await;
+        for addr in local_listen_addrs {
+            addrs.insert(addr.clone());
+            let _ = evt_tx.send(NetworkEvent::NewListenAddr(addr)).await;
+        }
     }
 
     // Hex-encoded public key of this node — used to filter reflected gossip.
@@ -48,19 +53,10 @@ pub(super) async fn gossip_task(
     // Active peer connections: peer_id → NodeClient.
     let mut peers: HashMap<String, crate::network::client::NodeClient> = HashMap::new();
 
-    // Reverse map: NodeAddr → peer_id. Used to route DMs via DHT mailbox lookup.
-    let mut peer_addrs: HashMap<NodeAddr, String> = HashMap::new();
-
     // Seed peer addresses for auto-reconnect: peer_id → (NodeAddr, Option<(community_pk, community_id)>).
     // When a seed peer drops, we spawn a reconnect loop so the embedded node
     // stays connected to always-on infrastructure.
     let mut seed_peers: HashMap<String, SeedPeerInfo> = HashMap::new();
-
-    // Mailbox announcements that couldn't be propagated yet because no peers
-    // were connected at announcement time.  Flushed to each new peer as it
-    // registers so the preference reaches the network without waiting up to
-    // an hour for the re-announcement loop.
-    let mut pending_mailbox_announcements: Vec<([u8; 32], NodeAddr)> = Vec::new();
 
     // ── Inbound gossip relay task ─────────────────────────────────────────────
     // Subscribes to our own NodeServer's push channel to see gossip from
@@ -126,15 +122,13 @@ pub(super) async fn gossip_task(
                     cmd,
                     &mut peers,
                     &mut seed_peers,
-                    &peer_addrs,
                     &identity,
                     &peer_reg_tx,
                     &gossip_evt_tx,
                     &own_pk_hex,
                     &evt_tx,
                     server_push_tx.as_ref(),
-                    &dht,
-                    &mut pending_mailbox_announcements,
+                    &own_addrs,
                 )
                 .await {
                     break;
@@ -154,40 +148,35 @@ pub(super) async fn gossip_task(
                             reg.peer_id.clone(),
                             reg.own_pk,
                         ));
-                        // Record addr→peer_id for DHT mailbox routing.
-                        peer_addrs.insert(reg.addr.clone(), reg.peer_id.clone());
                         // Track seed peer address so we can reconnect if it drops.
                         if reg.is_seed {
-                            seed_peers.insert(reg.peer_id.clone(), (reg.addr, reg.join_community.clone(), reg.join_community_password, reg.cert_fingerprint));
+                            seed_peers.insert(reg.peer_id.clone(), (reg.addr.clone(), reg.join_community.clone(), reg.join_community_password.clone(), reg.cert_fingerprint));
                             info!(peer_id = %reg.peer_id, "seed peer connected");
-                            if let Some((_, community_id)) = reg.join_community {
+                            if let Some((_, ref community_id)) = reg.join_community {
                                 let _ = evt_tx
-                                    .send(NetworkEvent::SeedPeerConnected { community_id })
+                                    .send(NetworkEvent::SeedPeerConnected {
+                                        community_id: community_id.clone(),
+                                        peer_id: reg.peer_id.clone(),
+                                    })
                                     .await;
                             }
+                        } else if let Some((_, ref community_id)) = reg.join_community {
+                            let _ = evt_tx
+                                .send(NetworkEvent::PeerConnected {
+                                    peer_id: reg.peer_id.clone(),
+                                    community_id: community_id.clone(),
+                                })
+                                .await;
+                        } else {
+                            // mDNS / LAN peer — community context unknown at dial time.
+                            // The event processor will probe all joined communities.
+                            let _ = evt_tx
+                                .send(NetworkEvent::LanPeerConnected {
+                                    peer_id: reg.peer_id.clone(),
+                                })
+                                .await;
                         }
-                        let _ = evt_tx
-                            .send(NetworkEvent::PeerConnected(reg.peer_id.clone()))
-                            .await;
-                        let new_client = reg.client;
-                        // Flush any mailbox announcements that were queued while
-                        // no peers were connected (e.g. on startup).
-                        if !pending_mailbox_announcements.is_empty() {
-                            let to_flush = std::mem::take(&mut pending_mailbox_announcements);
-                            let identity_clone = Arc::clone(&identity);
-                            let client_clone = new_client.clone();
-                            tokio::spawn(async move {
-                                for (user_pk, addr) in to_flush {
-                                    if let Err(e) =
-                                        client_clone.store_dht_record(user_pk, addr).await
-                                    {
-                                        debug!("pending mailbox flush store_dht_record failed: {e}");
-                                    }
-                                }
-                                drop(identity_clone);
-                            });
-                        }
-                        e.insert(new_client);
+                        e.insert(reg.client);
                     } else {
                         // Duplicate connection to the same peer (e.g. multiple
                         // addresses from a multi-homed host). Drop the extras to
@@ -199,7 +188,10 @@ pub(super) async fn gossip_task(
                         if reg.is_seed {
                             if let Some((_, community_id)) = reg.join_community {
                                 let _ = evt_tx
-                                    .send(NetworkEvent::SeedPeerConnected { community_id })
+                                    .send(NetworkEvent::SeedPeerConnected {
+                                        community_id,
+                                        peer_id: reg.peer_id.clone(),
+                                    })
                                     .await;
                             }
                         }
@@ -210,6 +202,18 @@ pub(super) async fn gossip_task(
             // ── Gossip event forwarded from a remote peer ─────────────────
             evt = gossip_evt_rx.recv() => {
                 if let Some(evt) = evt {
+                    match &evt {
+                        NetworkEvent::MessageReceived { topic, source, .. } => {
+                            debug!(%topic, source = ?source, "gossip: message arrived from peer");
+                        }
+                        NetworkEvent::PeerConnected { peer_id, .. } => {
+                            info!(%peer_id, "gossip: peer connection active");
+                        }
+                        NetworkEvent::PeerDisconnected(peer_id) => {
+                            info!(%peer_id, "gossip: peer disconnected");
+                        }
+                        _ => {}
+                    }
                     let _ = evt_tx.send(evt).await;
                 }
             }

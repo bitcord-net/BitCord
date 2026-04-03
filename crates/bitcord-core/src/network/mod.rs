@@ -1,5 +1,6 @@
 pub mod client;
 pub mod connection_manager;
+pub mod mdns;
 pub mod nat;
 pub mod network_handle;
 pub mod node_addr;

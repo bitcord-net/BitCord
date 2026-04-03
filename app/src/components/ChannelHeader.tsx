@@ -18,6 +18,7 @@ export function ChannelHeader({ channel, memberCount }: ChannelHeaderProps) {
 
   return (
     <header
+      data-tauri-drag-region
       style={{
         height: "48px",
         display: "flex",

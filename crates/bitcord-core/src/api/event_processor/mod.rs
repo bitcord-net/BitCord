@@ -16,14 +16,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::push_broadcaster::{CommunityEventData, PushEvent, SeedStatusData};
-use super::{AppState, remove_community_local, save_table};
-use crate::{
-    model::{
-        community::{CommunityManifest, SignedManifest},
-        types::CommunityId,
-    },
-    network::{NetworkCommand, NetworkEvent as SwarmEvent},
-};
+use super::{AppState, remove_community_local};
+use crate::network::{NetworkCommand, NetworkEvent as SwarmEvent};
 
 use addr::{expand_wildcard_addr, is_publicly_routable};
 
@@ -42,17 +36,45 @@ use addr::{expand_wildcard_addr, is_publicly_routable};
 pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, state: Arc<AppState>) {
     while let Some(event) = event_rx.recv().await {
         match event {
-            SwarmEvent::PeerConnected(peer_id) => {
-                peer::handle_peer_connected(&state, peer_id).await;
+            SwarmEvent::PeerConnected {
+                peer_id,
+                community_id,
+            } => {
+                peer::handle_peer_connected(&state, peer_id, community_id).await;
+            }
+
+            SwarmEvent::LanPeerConnected { peer_id } => {
+                // Probe every joined community — if the LAN peer hosts it, ManifestReceived
+                // will fire, register the peer into connected_peers, and kick off history sync.
+                let communities: Vec<(String, [u8; 32])> = {
+                    let comms = state.communities.read().await;
+                    comms
+                        .iter()
+                        .map(|(id, s)| (id.clone(), s.manifest.public_key))
+                        .collect()
+                };
+                for (community_id, community_pk) in communities {
+                    let _ = state
+                        .swarm_cmd_tx
+                        .send(crate::network::NetworkCommand::FetchManifest {
+                            peer_id: peer_id.clone(),
+                            community_id,
+                            community_pk,
+                        })
+                        .await;
+                }
             }
 
             SwarmEvent::PeerDisconnected(peer_id) => {
                 peer::handle_peer_disconnected(&state, peer_id).await;
             }
 
-            SwarmEvent::SeedPeerConnected { community_id } => {
+            SwarmEvent::SeedPeerConnected {
+                community_id,
+                peer_id,
+            } => {
                 use tracing::info;
-                info!(%community_id, "seed peer connected for community");
+                info!(%community_id, %peer_id, "seed peer connected for community");
                 state
                     .seed_connected_communities
                     .write()
@@ -61,9 +83,33 @@ pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, stat
                 state
                     .broadcaster
                     .send(PushEvent::SeedStatusChanged(SeedStatusData {
-                        community_id,
+                        community_id: community_id.clone(),
                         connected: true,
                     }));
+
+                // Fetch the community manifest from the seed peer so we pick up
+                // any channels / members that were created while we were offline.
+                if !peer_id.is_empty() {
+                    let community_pk = {
+                        let comms = state.communities.read().await;
+                        comms.get(&community_id).map(|s| s.manifest.public_key)
+                    };
+                    if let Some(cpk) = community_pk {
+                        let _ = state
+                            .swarm_cmd_tx
+                            .send(NetworkCommand::FetchManifest {
+                                peer_id: peer_id.clone(),
+                                community_id: community_id.clone(),
+                                community_pk: cpk,
+                            })
+                            .await;
+                    }
+                    // Also fetch any DMs queued in the seed's mailbox.
+                    let _ = state
+                        .swarm_cmd_tx
+                        .send(NetworkCommand::FetchMailbox { peer_id })
+                        .await;
+                }
             }
 
             SwarmEvent::SeedPeerDisconnected { community_id } => {
@@ -139,99 +185,51 @@ pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, stat
                 community_id,
                 peer_id,
             } => {
-                use tracing::info;
-                // A peer we queried no longer hosts this community.  If we are
-                // not the community admin (owner), this means the community was
-                // likely deleted while we were offline — remove it locally.
-                let should_remove = {
+                use tracing::debug;
+                // A peer we queried does not host this community.  This does NOT
+                // mean the community is deleted — the queried peer may be a global
+                // bootstrap/seed node that never hosted the manifest (only the admin
+                // node or dedicated seed nodes hold it).  Removing the community here
+                // based on a single 404 causes data loss on every restart when the
+                // first connected peer happens to be a bootstrap node.
+                //
+                // Instead, kick off a DHT peer discovery pass so we can locate and
+                // connect to the node that actually hosts the manifest.
+                debug!(
+                    %community_id,
+                    %peer_id,
+                    "peer returned 404 for community manifest; triggering DHT discovery"
+                );
+                let community_pk = {
                     let communities = state.communities.read().await;
-                    match communities.get(&community_id) {
-                        Some(signed) => {
-                            let own_pk = state.signing_key.verifying_key().to_bytes();
-                            signed.manifest.public_key != own_pk
-                        }
-                        None => false, // Already removed.
-                    }
+                    communities
+                        .get(&community_id)
+                        .map(|s| s.manifest.public_key)
                 };
-                if should_remove {
-                    info!(
-                        %community_id,
-                        %peer_id,
-                        "peer returned 404 for community manifest; removing stale community"
-                    );
-                    remove_community_local(&state, &community_id).await;
-                    state
-                        .broadcaster
-                        .send(PushEvent::CommunityDeleted(CommunityEventData {
-                            community_id,
-                            version: 0,
-                            reason: "community no longer found on known peers".to_string(),
-                        }));
+                if let Some(cpk) = community_pk {
+                    if let Some(dht) = &state.dht {
+                        let dht = dht.clone();
+                        let cmd_tx = state.swarm_cmd_tx.clone();
+                        tokio::spawn(async move {
+                            let peers = dht.find_community_peers(cpk).await.unwrap_or_default();
+                            if !peers.is_empty() {
+                                let peer_addrs: Vec<([u8; 32], crate::network::NodeAddr)> =
+                                    peers.into_iter().map(|r| (r.node_pk, r.addr)).collect();
+                                let _ = cmd_tx
+                                    .send(NetworkCommand::DiscoverAndDial {
+                                        peers: peer_addrs,
+                                        community_pk: cpk,
+                                        community_id,
+                                    })
+                                    .await;
+                            }
+                        });
+                    }
                 }
             }
 
             SwarmEvent::CommunityJoined(community_pk, id) => {
-                use tracing::debug;
-                let community_pk_hex = bs58::encode(community_pk).into_string();
-                debug!(%community_pk_hex, %id, "community joined via RPC; ensuring topics and sync");
-
-                // If we have the manifest in NodeStore, load it into state.communities.
-                if let Some(store) = &state.node_store {
-                    if let Ok(Some(meta)) = store.get_community_meta(&community_pk) {
-                        let mut comms = state.communities.write().await;
-                        if !comms.contains_key(&id) {
-                            match meta.manifest {
-                                Some(manifest) => {
-                                    // Real manifest available — persist it.
-                                    comms.insert(id.clone(), manifest);
-                                    save_table(
-                                        &state.data_dir.join("communities.json"),
-                                        &*comms,
-                                        state.encryption_key.as_ref(),
-                                    );
-                                }
-                                None => {
-                                    // No manifest yet. Insert an in-memory placeholder so that
-                                    // PeerConnected can queue a FetchManifest using its public key.
-                                    // Do NOT persist this to disk — the zeroed signature would be
-                                    // invalid, and the real manifest will overwrite this entry
-                                    // when it arrives via gossip.
-                                    comms.insert(
-                                        id.clone(),
-                                        SignedManifest {
-                                            manifest: CommunityManifest {
-                                                id: ulid::Ulid::from_string(&id)
-                                                    .map(CommunityId)
-                                                    .unwrap_or_else(|_| CommunityId::new()),
-                                                name: "Syncing...".to_string(),
-                                                description: String::new(),
-                                                public_key: community_pk,
-                                                created_at: chrono::Utc::now(),
-                                                admin_ids: vec![],
-                                                channel_ids: vec![],
-                                                seed_nodes: vec![],
-                                                version: 0,
-                                                deleted: false,
-                                            },
-                                            signature: vec![0u8; 64],
-                                        },
-                                    );
-                                    let mut pending = state.pending_manifest_syncs.lock().await;
-                                    if !pending.contains(&id) {
-                                        pending.push(id.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Subscribe to community topic regardless of whether we have the manifest yet.
-                let topic = format!("/bitcord/community/{id}/1.0.0");
-                let _ = state
-                    .swarm_cmd_tx
-                    .send(NetworkCommand::Subscribe(topic))
-                    .await;
+                community_handler::handle_community_joined(&state, community_pk, id).await;
             }
 
             SwarmEvent::CommunityJoinFailed {
@@ -260,6 +258,7 @@ pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, stat
                 let peer_suffix = format!("/p2p/{}", state.node_address);
                 let expanded = expand_wildcard_addr(&addr, &peer_suffix);
                 let mut addrs = state.actual_listen_addrs.write().await;
+                let mut newly_public = false;
                 for a in &expanded {
                     if !addrs.contains(a) {
                         addrs.push(a.clone());
@@ -270,10 +269,26 @@ pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, stat
                         let mut public = state.public_addr.write().await;
                         if public.is_none() {
                             *public = Some(a.clone());
+                            newly_public = true;
                             if let Some(fp) = &state.local_tls_fingerprint_hex {
                                 use tracing::info;
                                 info!(addr = %a, fingerprint = %fp, "public address discovered");
                             }
+                        }
+                    }
+                }
+                // On first public address discovery, announce this node's presence in
+                // every community it belongs to via DhtHandle.  This is needed for
+                // Tauri embedded nodes whose DHT self_addr is None at startup — it gets
+                // populated when the STUN-discovered address fires AddListenAddr.
+                if newly_public {
+                    drop(addrs); // release write lock before acquiring communities read lock
+                    if let Some(dht) = &state.dht {
+                        let comms = state.communities.read().await.clone();
+                        for signed in comms.values() {
+                            let cpk = signed.manifest.public_key;
+                            let dht2 = dht.clone();
+                            tokio::spawn(async move { dht2.register_community_peer(cpk).await });
                         }
                     }
                 }

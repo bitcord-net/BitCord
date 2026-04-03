@@ -21,7 +21,7 @@ use crate::{
     model::network_event::NetworkEvent,
     network::protocol::{ClientRequest, NodePush, NodeResponse, decode_payload, encode_frame},
     network::{NetworkCommand, NodeAddr},
-    node::{NodeServices, dht::NodeId, store::CommunityMeta, store::NodeStore},
+    node::{NodeServices, store::CommunityMeta, store::NodeStore},
     state::message_log::LogEntry,
 };
 
@@ -198,10 +198,12 @@ impl ConnectionHandler {
                 .await;
                 // Track the authenticated peer in the routing table.
                 if matches!(resp, NodeResponse::Authenticated { .. }) {
-                    services.dht.add_peer(
-                        NodeId(*pk),
-                        NodeAddr::new(remote_addr.ip(), remote_addr.port()),
-                    );
+                    if let Some(dht) = &services.dht {
+                        dht.add_known_peer(
+                            *pk,
+                            NodeAddr::new(remote_addr.ip(), remote_addr.port()),
+                        );
+                    }
                 }
                 resp
             }
@@ -298,18 +300,11 @@ impl ConnectionHandler {
                 let sender_pk = sender_pk.unwrap();
                 match services.store.append_dm(recipient_pk, &sender_pk, envelope) {
                     Ok(seq) => {
-                        // Record that this node holds a mailbox for this recipient.
-                        services.dht.announce_mailbox(*recipient_pk);
-                        // Propagate the routing record to K closest peers so other
-                        // nodes can resolve the mailbox via iterative DHT lookup.
-                        if let Some(self_addr) = services.dht.self_addr() {
-                            let _ = services
-                                .swarm_cmd_tx
-                                .send(NetworkCommand::PropagateDhtRecord {
-                                    user_pk: *recipient_pk,
-                                    self_addr: self_addr.clone(),
-                                })
-                                .await;
+                        // Record that this node holds a mailbox for this recipient
+                        // and propagate to K closest DHT peers.
+                        if let Some(dht) = services.dht.clone() {
+                            let pk = *recipient_pk;
+                            tokio::spawn(async move { dht.register_mailbox(pk).await });
                         }
                         // Best-effort push to recipient if they are connected.
                         if let Ok(entries) = services.store.get_dms(recipient_pk, seq) {
@@ -426,20 +421,56 @@ impl ConnectionHandler {
 
             ClientRequest::FindNode { target_id } => {
                 // No authentication required — public DHT operation.
-                let peers = services
-                    .dht
-                    .closest_peers(&NodeId(*target_id), 20)
-                    .into_iter()
-                    .map(|(id, addr)| (id.0, addr))
-                    .collect();
-                let mailbox = services.dht.lookup_mailbox(target_id);
+                let (peers, mailbox) = if let Some(dht) = &services.dht {
+                    let peers = dht
+                        .closest_peers(*target_id, 20)
+                        .into_iter()
+                        .map(|(id, addr)| (id.0, addr))
+                        .collect();
+                    let mailbox = dht.lookup_mailbox_local(*target_id);
+                    (peers, mailbox)
+                } else {
+                    (vec![], None)
+                };
                 NodeResponse::ClosestPeers { peers, mailbox }
             }
 
             ClientRequest::StoreDhtRecord { user_pk, addr } => {
                 // No authentication required — public DHT operation.
-                services.dht.add_mailbox_record(*user_pk, addr.clone());
+                if let Some(dht) = &services.dht {
+                    dht.add_mailbox_record(*user_pk, addr.clone());
+                }
                 NodeResponse::DhtAck
+            }
+
+            ClientRequest::StoreCommunityPeer {
+                community_pk,
+                node_pk,
+                addr,
+            } => {
+                // No authentication required — public DHT operation.
+                if let Some(dht) = &services.dht {
+                    let record = bitcord_dht::CommunityPeerRecord {
+                        node_pk: *node_pk,
+                        addr: addr.clone(),
+                        announced_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    dht.add_community_peer_record(*community_pk, record);
+                }
+                NodeResponse::CommunityPeerAck
+            }
+
+            ClientRequest::FindCommunityPeers { community_pk } => {
+                // No authentication required — public DHT operation.
+                let records = services
+                    .dht
+                    .as_ref()
+                    .map(|d| d.lookup_community_peers_local(*community_pk))
+                    .unwrap_or_default();
+                NodeResponse::CommunityPeers(records)
             }
 
             ClientRequest::Heartbeat => NodeResponse::Authenticated {
@@ -705,21 +736,30 @@ impl ConnectionHandler {
             let _ = services.store.set_community_meta(&cert.community_pk, &meta);
         }
 
-        // Update session.
-        let mut sess = session.lock().await;
-        if !sess.joined_communities.contains(&cert.community_pk) {
-            sess.joined_communities.push(cert.community_pk);
-        }
+        // Update session — only notify on the first join for this community in this session.
+        let is_new_join = {
+            let mut sess = session.lock().await;
+            if !sess.joined_communities.contains(&cert.community_pk) {
+                sess.joined_communities.push(cert.community_pk);
+                true
+            } else {
+                false
+            }
+        };
 
         // Notify the rest of the node so it can subscribe to topics and sync manifest.
-        if let Some(community_id) = community_id_opt {
-            let _ = services
-                .swarm_cmd_tx
-                .send(NetworkCommand::NotifyCommunityJoined(
-                    cert.community_pk,
-                    community_id,
-                ))
-                .await;
+        // Only fire on the first join — FetchChannelHistory re-sends JoinCommunity for
+        // every channel fetch, so without this guard the notification fires once per channel.
+        if is_new_join {
+            if let Some(community_id) = community_id_opt {
+                let _ = services
+                    .swarm_cmd_tx
+                    .send(NetworkCommand::NotifyCommunityJoined(
+                        cert.community_pk,
+                        community_id,
+                    ))
+                    .await;
+            }
         }
 
         NodeResponse::Authenticated {

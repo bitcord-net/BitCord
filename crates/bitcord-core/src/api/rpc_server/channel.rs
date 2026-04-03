@@ -11,7 +11,8 @@ use super::super::{
     push_broadcaster::PushEvent,
     save_table,
     types::{
-        ChannelInfo, ChannelKindDto, CreateChannelParams, DeleteChannelParams, RotateKeyParams,
+        ChannelInfo, ChannelKindDto, CreateChannelParams, DeleteChannelParams,
+        ReorderChannelsParams, RotateKeyParams,
     },
 };
 use super::{
@@ -33,11 +34,31 @@ pub(super) fn register_channel_methods(
     module.register_async_method("channel_list", |params, ctx, _| async move {
         let community_id: String = params.one().map_err(|e| invalid_params(e.to_string()))?;
         let channels = ctx.channels.read().await;
-        let list: Vec<ChannelInfo> = channels
+        // Collect channels belonging to this community.
+        let mut map: std::collections::HashMap<String, ChannelInfo> = channels
             .values()
             .filter(|c| c.community_id.to_string() == community_id)
-            .map(channel_manifest_to_info)
+            .map(|c| (c.id.to_string(), channel_manifest_to_info(c)))
             .collect();
+        // Return them in the order specified by the community manifest's channel_ids.
+        let ordered_ids: Vec<String> = {
+            let communities = ctx.communities.read().await;
+            communities
+                .get(&community_id)
+                .map(|s| {
+                    s.manifest
+                        .channel_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut list: Vec<ChannelInfo> =
+            ordered_ids.iter().filter_map(|id| map.remove(id)).collect();
+        // Append any channels not yet listed in the manifest (e.g. created by a peer
+        // whose ManifestUpdate we haven't received yet).
+        list.extend(map.into_values());
         Ok::<Vec<ChannelInfo>, ErrorObjectOwned>(list)
     })?;
 
@@ -455,6 +476,108 @@ pub(super) fn register_channel_methods(
                 debug!("channel_rotate_key: failed to encode ChannelManifestBroadcast: {e}")
             }
         }
+
+        Ok::<bool, ErrorObjectOwned>(true)
+    })?;
+
+    module.register_async_method("channel_reorder", |params, ctx, _| async move {
+        let p: ReorderChannelsParams = params.parse().map_err(|e| invalid_params(e.to_string()))?;
+
+        require_seed_connected(&ctx, &p.community_id).await?;
+
+        // Validate that all supplied IDs belong to this community.
+        {
+            let channels = ctx.channels.read().await;
+            for id in &p.channel_ids {
+                match channels.get(id) {
+                    Some(ch) if ch.community_id.to_string() == p.community_id => {}
+                    Some(_) => {
+                        return Err(invalid_params(format!(
+                            "channel {id} does not belong to community"
+                        )));
+                    }
+                    None => return Err(not_found(format!("channel {id} not found"))),
+                }
+            }
+        }
+
+        // Parse the new ordered list as ChannelId ULIDs.
+        let new_order: Vec<crate::model::types::ChannelId> = p
+            .channel_ids
+            .iter()
+            .map(|id| {
+                ulid::Ulid::from_string(id)
+                    .map(crate::model::types::ChannelId)
+                    .map_err(|_| invalid_params(format!("invalid channel_id: {id}")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Update the community manifest with the new channel order and re-sign.
+        let (community_version, updated_manifest) = {
+            let mut communities = ctx.communities.write().await;
+            let signed = communities
+                .get_mut(&p.community_id)
+                .ok_or_else(|| not_found("community not found"))?;
+            let mut updated = signed.manifest.clone();
+            // Preserve any IDs not in the supplied list (shouldn't happen, but be safe).
+            let supplied: std::collections::HashSet<String> =
+                p.channel_ids.iter().cloned().collect();
+            let remaining: Vec<crate::model::types::ChannelId> = updated
+                .channel_ids
+                .iter()
+                .filter(|id| !supplied.contains(&id.to_string()))
+                .cloned()
+                .collect();
+            updated.channel_ids = new_order;
+            updated.channel_ids.extend(remaining);
+            updated.version += 1;
+            let new_signed = updated.sign(&ctx.signing_key);
+            let version = new_signed.manifest.version;
+            let cloned = new_signed.clone();
+            *signed = new_signed;
+            save_table(
+                &ctx.data_dir.join("communities.json"),
+                &*communities,
+                ctx.encryption_key.as_ref(),
+            );
+            (version, cloned)
+        };
+
+        // Sync the reordered manifest to NodeStore so FetchManifest responses
+        // return the correct channel order (channel_reorder only updates
+        // communities.json / in-memory state, not the persistent NodeStore).
+        if let Some(store) = &ctx.node_store {
+            if let Ok(Some(mut meta)) =
+                store.get_community_meta(&updated_manifest.manifest.public_key)
+            {
+                meta.manifest = Some(updated_manifest.clone());
+                let _ = store.set_community_meta(&updated_manifest.manifest.public_key, &meta);
+            }
+        }
+
+        // Broadcast updated manifest to peers so everyone sees the new order.
+        let community_topic = format!("/bitcord/community/{}/1.0.0", p.community_id);
+        match crate::model::network_event::NetworkEvent::ManifestUpdate(updated_manifest).encode() {
+            Ok(encoded) => {
+                let _ = ctx
+                    .swarm_cmd_tx
+                    .send(crate::network::NetworkCommand::Publish {
+                        topic: community_topic,
+                        data: encoded,
+                    })
+                    .await;
+            }
+            Err(e) => debug!("channel_reorder: failed to encode ManifestUpdate: {e}"),
+        }
+
+        // Notify all connected frontends so they reload the channel list in new order.
+        ctx.broadcaster.send(PushEvent::CommunityManifestUpdated(
+            push_broadcaster::CommunityEventData {
+                community_id: p.community_id,
+                version: community_version,
+                reason: String::new(),
+            },
+        ));
 
         Ok::<bool, ErrorObjectOwned>(true)
     })?;

@@ -9,7 +9,7 @@
 //! use bitcord_core::{
 //!     identity::NodeIdentity,
 //!     network::{NetworkCommand, tls::NodeTlsCert},
-//!     node::{server::NodeServer, store::NodeStore, dht::Dht, NodeServicesConfig},
+//!     node::{server::NodeServer, store::NodeStore, NodeServicesConfig},
 //!     resource::connection_limiter::ConnectionLimiter,
 //! };
 //!
@@ -17,8 +17,7 @@
 //! let identity = NodeIdentity::generate();
 //! let sk = bitcord_core::identity::SigningKey::from_bytes(&identity.signing_key_bytes());
 //! let tls_cert = NodeTlsCert::generate(&sk)?;
-//! let store = Arc::new(NodeStore::open(std::path::Path::new("node.redb"))?);
-//! let dht = Arc::new(Dht::new(identity.verifying_key().to_bytes(), None));
+//! let store = Arc::new(NodeStore::open(std::path::Path::new("node.redb"), None)?);
 //! let limiter = Arc::new(ConnectionLimiter::new(50));
 //! let node_pk = identity.verifying_key().to_bytes();
 //! let (swarm_cmd_tx, _swarm_cmd_rx) = tokio::sync::mpsc::channel::<NetworkCommand>(1);
@@ -28,7 +27,7 @@
 //!     &tls_cert,
 //!     NodeServicesConfig {
 //!         store,
-//!         dht,
+//!         dht: None,
 //!         limiter,
 //!         node_pk,
 //!         swarm_cmd_tx,

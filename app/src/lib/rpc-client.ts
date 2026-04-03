@@ -22,6 +22,7 @@ import type {
   ChannelInfo,
   CreateChannelParams,
   DeleteChannelParams,
+  ReorderChannelsParams,
   RotateKeyParams,
   MessageInfo,
   SendMessageParams,
@@ -303,6 +304,8 @@ export class BitCordClient {
     this.call<boolean>("channel_delete", p);
   channelRotateKey = (p: RotateKeyParams) =>
     this.call<boolean>("channel_rotate_key", p);
+  channelReorder = (p: ReorderChannelsParams) =>
+    this.call<boolean>("channel_reorder", p);
 
   // Messages
   messageSend = (p: SendMessageParams) =>

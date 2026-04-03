@@ -63,6 +63,7 @@ impl ApiHandle {
 use crate::{
     config::NodeConfig,
     crypto::channel_keys::ChannelKey,
+    dht::DhtHandle,
     model::{
         channel::ChannelManifest, community::SignedManifest, membership::MembershipRecord,
         message::MessageContent,
@@ -254,7 +255,7 @@ pub struct AppState {
     /// Broadcaster for server-to-client push events.
     pub broadcaster: PushBroadcaster,
     /// Snapshot of currently connected peers, updated by the swarm event loop.
-    pub connected_peers: Arc<RwLock<Vec<PeerSummary>>>,
+    pub connected_peers: Arc<RwLock<HashMap<String, Vec<PeerSummary>>>>,
     /// Community store: community_id → signed manifest (persisted to data_dir).
     pub communities: Arc<RwLock<HashMap<String, SignedManifest>>>,
     /// Channel store: channel_id → channel manifest (persisted to data_dir).
@@ -316,6 +317,8 @@ pub struct AppState {
     /// SHA-256 fingerprint of this node's own TLS certificate (64-char hex).
     /// Present when the embedded QUIC server is running; `None` otherwise.
     pub local_tls_fingerprint_hex: Option<String>,
+    /// DHT handle for mailbox/community routing; `None` for `GossipClient` mode.
+    pub dht: Option<Arc<DhtHandle>>,
 }
 
 impl AppState {
@@ -333,6 +336,7 @@ impl AppState {
         node_store: Option<Arc<crate::node::store::NodeStore>>,
         encryption_key: Option<[u8; 32]>,
         local_tls_fingerprint_hex: Option<String>,
+        dht: Option<Arc<DhtHandle>>,
     ) -> Self {
         let data_dir = config.data_dir.clone();
         let ek = encryption_key.as_ref();
@@ -499,7 +503,7 @@ impl AppState {
             swarm_cmd_tx,
             metrics,
             broadcaster: PushBroadcaster::new(),
-            connected_peers: Arc::new(RwLock::new(Vec::new())),
+            connected_peers: Arc::new(RwLock::new(HashMap::new())),
             communities: Arc::new(RwLock::new(communities)),
             channels: Arc::new(RwLock::new(channels)),
             channel_keys: Arc::new(RwLock::new(channel_keys)),
@@ -522,70 +526,8 @@ impl AppState {
             previous_channel_keys: Arc::new(RwLock::new(previous_channel_keys)),
             seed_fingerprints: Arc::new(RwLock::new(seed_fingerprints)),
             local_tls_fingerprint_hex,
+            dht,
         }
-    }
-
-    /// Re-save all JSON tables with the current encryption key.
-    ///
-    /// Called once after construction when an encryption key is present to
-    /// migrate any existing plaintext files to encrypted form.
-    pub async fn migrate_tables_to_encrypted(&self) {
-        let ek = match self.encryption_key.as_ref() {
-            Some(k) => Some(k),
-            None => return,
-        };
-        save_table(
-            &self.data_dir.join("communities.json"),
-            &*self.communities.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("channels.json"),
-            &*self.channels.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("channel_keys.json"),
-            &*self.channel_keys.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("previous_channel_keys.json"),
-            &*self.previous_channel_keys.read().await,
-            ek,
-        );
-        save_table(&self.data_dir.join("dms.json"), &*self.dms.read().await, ek);
-        save_table(
-            &self.data_dir.join("dm_peers.json"),
-            &*self.dm_peers.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("members.json"),
-            &*self.members.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("bans.json"),
-            &*self.bans.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("read_state.json"),
-            &*self.read_state.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("hosting_passwords.json"),
-            &*self.hosting_passwords.read().await,
-            ek,
-        );
-        save_table(
-            &self.data_dir.join("seed_fingerprints.json"),
-            &*self.seed_fingerprints.read().await,
-            ek,
-        );
-        info!("migrated JSON tables to encrypted storage");
     }
 
     /// Re-subscribe to all known community and channel topics.
@@ -601,21 +543,10 @@ impl AppState {
 
         let mut pending = self.pending_manifest_syncs.lock().await;
 
-        // Dial global bootstrap seed nodes.
-        for addr_str in &config.seed_nodes {
-            if let Ok(addr) = addr_str.parse::<crate::network::NodeAddr>() {
-                debug!(%addr, "bootstrapping global seed node dial");
-                let _ = self
-                    .swarm_cmd_tx
-                    .send(NetworkCommand::Dial {
-                        addr,
-                        is_seed: true,
-                        join_community: None,
-                        join_community_password: None,
-                        cert_fingerprint: [0u8; 32],
-                    })
-                    .await;
-            }
+        // Bootstrap DHT routing table via DhtHandle (fires-and-forgets each dial).
+        if let Some(dht) = &self.dht {
+            let dht = Arc::clone(dht);
+            tokio::spawn(async move { dht.bootstrap().await });
         }
 
         for (id, signed) in communities.iter() {
@@ -625,8 +556,11 @@ impl AppState {
             }
 
             // Proactively try to fetch from any ALREADY connected peers.
-            let connected_peers = self.connected_peers.read().await.clone();
-            for peer in connected_peers {
+            let peers_for_community = {
+                let peers_map = self.connected_peers.read().await;
+                peers_map.get(id).cloned().unwrap_or_default()
+            };
+            for peer in peers_for_community {
                 let _ = self
                     .swarm_cmd_tx
                     .send(NetworkCommand::FetchManifest {

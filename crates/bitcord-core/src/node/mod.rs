@@ -1,16 +1,15 @@
 //! Node server-side implementation.
 //!
-//! Provides the persistent storage layer (`store`), in-memory DHT (`dht`),
-//! per-connection request handler (`handler`), and the QUIC accept loop
-//! (`server`).
+//! Provides the persistent storage layer (`store`), per-connection request
+//! handler (`handler`), and the QUIC accept loop (`server`).
 
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::dht::DhtHandle;
 use crate::network::NetworkCommand;
 use crate::resource::connection_limiter::ConnectionLimiter;
 
-pub mod dht;
 pub mod handler;
 pub mod init;
 pub mod server;
@@ -24,7 +23,8 @@ pub use init::{NodeInitConfig, NodeInitResult, init_node};
 /// passing many individual arguments to handlers and servers.
 pub struct NodeServices {
     pub store: Arc<store::NodeStore>,
-    pub dht: Arc<dht::Dht>,
+    /// DHT handle for routing lookups; `None` for `GossipClient` mode.
+    pub dht: Option<Arc<DhtHandle>>,
     pub limiter: Arc<ConnectionLimiter>,
     pub node_pk: [u8; 32],
     pub swarm_cmd_tx: mpsc::Sender<NetworkCommand>,
@@ -36,7 +36,8 @@ pub struct NodeServices {
 /// Configuration for creating NodeServices.
 pub struct NodeServicesConfig {
     pub store: Arc<store::NodeStore>,
-    pub dht: Arc<dht::Dht>,
+    /// DHT handle; `None` for `GossipClient` mode.
+    pub dht: Option<Arc<DhtHandle>>,
     pub limiter: Arc<ConnectionLimiter>,
     pub node_pk: [u8; 32],
     pub swarm_cmd_tx: mpsc::Sender<NetworkCommand>,

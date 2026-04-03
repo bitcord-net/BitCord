@@ -367,7 +367,7 @@ async fn start_backend_with_passphrase(app_handle: AppHandle, passphrase: &str) 
     let identity = std::sync::Arc::new(identity);
 
     let data_dir = config.data_dir.clone();
-    let server_enabled = config.server_enabled;
+    let is_server = config.node_mode != bitcord_core::config::NodeMode::GossipClient;
 
     // ── Shared node initialization ────────────────────────────────────────────
     let result = init_node(NodeInitConfig {
@@ -380,7 +380,6 @@ async fn start_backend_with_passphrase(app_handle: AppHandle, passphrase: &str) 
         config,
         config_path,
         join_password: None,
-        server_enabled,
         fallback_to_random_port: true,
         dht_self_addr: None,
         store_db_path: data_dir.join("node.redb"),
@@ -391,9 +390,13 @@ async fn start_backend_with_passphrase(app_handle: AppHandle, passphrase: &str) 
     app_handle.manage(result.metrics_tx);
 
     // ── NodeClient connection to embedded server ───────────────────────────────
-    let node_state_local_client = if server_enabled {
-        let actual_port = result.quic_port.expect("server_enabled=true");
-        let cert_fingerprint = result.cert_fingerprint.expect("server_enabled=true");
+    let node_state_local_client = if is_server {
+        let actual_port = result
+            .quic_port
+            .expect("QUIC server must be running in Peer/HeadlessSeed mode");
+        let cert_fingerprint = result
+            .cert_fingerprint
+            .expect("QUIC server must be running in Peer/HeadlessSeed mode");
         let local_node_addr = NodeAddr::new("127.0.0.1".parse().unwrap(), actual_port);
         let (local_client, _local_node_pk, push_rx) = NodeClient::connect(
             local_node_addr,
@@ -412,11 +415,10 @@ async fn start_backend_with_passphrase(app_handle: AppHandle, passphrase: &str) 
     let store = app_state.node_store.clone().expect("node_store always set");
 
     // ── Background cache retention janitor ────────────────────────────────────
-    let (is_seed_node, storage_limit_mb) = {
-        let c = app_state.config.read().await;
-        (c.is_seed_node, c.storage_limit_mb)
-    };
-    if !is_seed_node {
+    let storage_limit_mb = app_state.config.read().await.storage_limit_mb;
+    let is_headless_seed =
+        app_state.config.read().await.node_mode == bitcord_core::config::NodeMode::HeadlessSeed;
+    if !is_headless_seed {
         let store_for_retention = std::sync::Arc::clone(&store);
         let max_bytes = storage_limit_mb * 1_048_576;
         tauri::async_runtime::spawn(async move {
@@ -635,12 +637,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_hide = MenuItemBuilder::new("Show / Hide")
         .id("show_hide")
         .build(app)?;
-    let settings = MenuItemBuilder::new("Settings").id("settings").build(app)?;
     let quit = MenuItemBuilder::new("Quit BitCord").id("quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show_hide)
-        .item(&settings)
         .separator()
         .item(&quit)
         .build()?;
@@ -650,10 +650,6 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .tooltip("BitCord")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show_hide" => toggle_window(app),
-            "settings" => {
-                show_window(app);
-                let _ = app.emit("navigate", "/app/settings");
-            }
             "quit" => {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.destroy();
@@ -705,11 +701,56 @@ fn show_window(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── 1. Init tracing (static for now) ───────────────────────────────────────
+    // Read config at very early boot to determine the log level.
+    let log_level = {
+        // Match Tauri's app_data_dir() behavior:
+        // - Linux:   ~/.local/share/net.bitcord.client/
+        // - macOS:   ~/Library/Application Support/net.bitcord.client/
+        // - Windows: %APPDATA%\net.bitcord.client\
+        let base = if cfg!(windows) {
+            std::env::var_os("APPDATA")
+                .map(|p| std::path::PathBuf::from(p).join("net.bitcord.client"))
+        } else {
+            // Match Tauri's app_data_dir() on Linux/macOS:
+            // Linux:   ~/.local/share/net.bitcord.client/
+            // macOS:   ~/Library/Application Support/net.bitcord.client/
+            directories::BaseDirs::new().map(|d| {
+                let mut p = d.data_dir().to_path_buf();
+                if cfg!(target_os = "macos") {
+                    p.push("Application Support");
+                }
+                p.push("net.bitcord.client");
+                p
+            })
+        };
+
+        let config_path = base.map(|b| b.join("config.toml"));
+        let mut level = "info".to_string();
+
+        if let Some(path) = config_path {
+            if let Ok(c) = NodeConfig::load(&path) {
+                level = c.log_level;
+            }
+        }
+        level
+    };
+
+    // If RUST_LOG is already set in the environment, use it (developer override).
+    // Otherwise, use the level from the config file, but add some noise reduction
+    // for third-party crates like mdns_sd and quinn which are very verbose.
+    let filter = if let Ok(env) = std::env::var("RUST_LOG") {
+        env
+    } else if log_level == "debug" {
+        "debug,mdns_sd=info,quinn=info".to_string()
+    } else if log_level == "trace" {
+        "trace,mdns_sd=info,quinn=info".to_string()
+    } else {
+        log_level
+    };
+
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
         .try_init();
 
     let builder = tauri::Builder::default();

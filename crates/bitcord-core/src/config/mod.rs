@@ -5,6 +5,23 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Operating mode of the node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeMode {
+    /// No QUIC server, no DHT, no mDNS.  Pure gossip receiver.
+    /// Ideal for users who always connect to a seed node.
+    GossipClient,
+    /// Full peer: QUIC server + DHT + gossip relay + user identity.
+    /// This is the default for interactive users.
+    #[default]
+    Peer,
+    /// Headless only.  No user identity.
+    /// Hosts communities, DM mailboxes, and DHT routing.  Never sends
+    /// presence/`MemberJoined` events.  No GUI.
+    HeadlessSeed,
+}
+
 /// Node configuration, stored as TOML.
 ///
 /// All fields have sensible defaults so a first-run node works without any
@@ -26,22 +43,16 @@ pub struct NodeConfig {
     pub storage_limit_mb: u64,
     /// Bandwidth limit in kilobits per second (`None` = unlimited).
     pub bandwidth_limit_kbps: Option<u64>,
-    /// Whether this node advertises itself as a seed/relay node.
-    pub is_seed_node: bool,
+    /// Node operating mode.
+    pub node_mode: NodeMode,
     /// Priority for seed node selection (higher = preferred).
     pub seed_priority: u8,
-    /// Enable mDNS local network peer discovery.
-    pub mdns_enabled: bool,
     /// Tracing log level filter (e.g. `"info"`, `"debug"`, `"warn"`).
     pub log_level: String,
     /// UDP port for the QUIC transport server.
     pub quic_port: u16,
     /// Persisted display name set during onboarding.
     pub display_name: Option<String>,
-    /// Whether to run the embedded QUIC server.  When `false` the node acts as
-    /// a pure client and does not bind any listening port (reduces resource
-    /// usage and attack surface for users who always connect to a seed node).
-    pub server_enabled: bool,
     /// If set, clients must supply this password in `JoinCommunity` QUIC requests
     /// to register a new community on this node.  Existing members bypass this
     /// check and can reconnect without a password.  Leave unset for an open node.
@@ -75,13 +86,11 @@ impl Default for NodeConfig {
             max_connections: 50,
             storage_limit_mb: 512,
             bandwidth_limit_kbps: None,
-            is_seed_node: false,
+            node_mode: NodeMode::Peer,
             seed_priority: 0,
-            mdns_enabled: true,
             log_level: "info".to_string(),
             quic_port: 9042,
             display_name: None,
-            server_enabled: true,
             join_password: None,
             save_passphrase: false,
             preferred_mailbox_node: None,
@@ -110,7 +119,9 @@ impl NodeConfig {
         if path.exists() {
             let s =
                 std::fs::read_to_string(path).with_context(|| format!("read config {:?}", path))?;
-            toml::from_str(&s).with_context(|| format!("parse config {:?}", path))
+            let cfg: Self =
+                toml::from_str(&s).with_context(|| format!("parse config {:?}", path))?;
+            Ok(cfg)
         } else {
             Ok(Self::default())
         }
@@ -163,6 +174,7 @@ mod tests {
         assert_eq!(loaded.max_connections, 25);
         assert_eq!(loaded.log_level, "debug");
         assert_eq!(loaded.bandwidth_limit_kbps, Some(1024));
+        assert_eq!(loaded.node_mode, NodeMode::Peer);
     }
 
     #[test]
@@ -172,5 +184,19 @@ mod tests {
         let cfg = NodeConfig::load(&path).unwrap();
         assert_eq!(cfg.max_connections, 50);
         assert_eq!(cfg.storage_limit_mb, 512);
+        assert_eq!(cfg.node_mode, NodeMode::Peer);
+    }
+
+    #[test]
+    fn node_mode_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let cfg = NodeConfig {
+            node_mode: NodeMode::GossipClient,
+            ..Default::default()
+        };
+        cfg.save(&path).unwrap();
+        let loaded = NodeConfig::load(&path).unwrap();
+        assert_eq!(loaded.node_mode, NodeMode::GossipClient);
     }
 }

@@ -77,12 +77,22 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
                     postcard::to_allocvec(&payload).unwrap_or_else(|_| p.body.as_bytes().to_vec());
                 match DmEnvelope::seal(&sender_sk, &recipient_pk, &payload_bytes) {
                     Ok(envelope) => {
+                        // Resolve mailbox address via DHT before sending.
+                        let mailbox_addr = if let Some(dht) = &ctx.dht {
+                            dht.find_mailbox_peers(x25519_pk)
+                                .await
+                                .ok()
+                                .and_then(|v| v.into_iter().next())
+                        } else {
+                            None
+                        };
                         if ctx
                             .swarm_cmd_tx
                             .send(NetworkCommand::SendDm {
                                 peer_id: p.peer_id.clone(),
                                 recipient_x25519_pk: x25519_pk,
                                 envelope,
+                                mailbox_addr,
                             })
                             .await
                             .is_err()
@@ -169,16 +179,15 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
                 }
             }
 
-            // Derive our X25519 public key and announce the preference to the DHT.
+            // Announce our mailbox preference to the DHT.
             let our_x25519_pk = NodeIdentity::from_signing_key_bytes(&ctx.signing_key.to_bytes())
                 .x25519_public_key_bytes();
-            let _ = ctx
-                .swarm_cmd_tx
-                .send(crate::network::NetworkCommand::AnnouncePreferredMailbox {
-                    user_pk: our_x25519_pk,
-                    addr,
-                })
-                .await;
+            if let Some(dht) = &ctx.dht {
+                let dht = dht.clone();
+                // Update the DHT self-address hint from the configured mailbox node addr.
+                dht.update_self_addr(addr);
+                tokio::spawn(async move { dht.register_mailbox(our_x25519_pk).await });
+            }
 
             Ok::<String, ErrorObjectOwned>(addr_str)
         },

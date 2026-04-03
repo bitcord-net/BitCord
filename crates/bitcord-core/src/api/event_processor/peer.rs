@@ -4,97 +4,114 @@ use tracing::info;
 
 use super::super::AppState;
 use super::super::types::PeerSummary;
-use crate::{
-    model::network_event::{ChannelManifestBroadcastPayload, NetworkEvent},
-    network::NetworkCommand,
-};
+use crate::network::NetworkCommand;
 
 /// Handle a `PeerConnected` swarm event.
-pub(super) async fn handle_peer_connected(state: &Arc<AppState>, peer_id: String) {
-    info!(%peer_id, "peer connected");
-    let peer_id_str = peer_id;
+pub(super) async fn handle_peer_connected(
+    state: &Arc<AppState>,
+    peer_id: String,
+    community_id: String,
+) {
+    info!(%peer_id, %community_id, "community peer connected");
+
+    // Determine whether this peer is the community admin (their Ed25519 pk ==
+    // the community public key stored in the manifest).
+    let is_admin = {
+        let comms = state.communities.read().await;
+        comms.get(&community_id).is_some_and(|signed| {
+            let admin_pk_hex: String = signed
+                .manifest
+                .public_key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            admin_pk_hex == peer_id
+        })
+    };
+
     {
-        let mut peers = state.connected_peers.write().await;
-        if !peers.iter().any(|p| p.peer_id == peer_id_str) {
-            peers.push(PeerSummary {
-                peer_id: peer_id_str.clone(),
+        let mut peers_map = state.connected_peers.write().await;
+        let list = peers_map.entry(community_id.clone()).or_default();
+        if !list.iter().any(|p| p.peer_id == peer_id) {
+            list.push(PeerSummary {
+                peer_id: peer_id.clone(),
                 addresses: vec![],
                 latency_ms: None,
                 relay_capable: false,
                 reputation: 0,
+                is_admin,
+                community_id: community_id.clone(),
             });
         }
+        // Update metrics: count unique peers across all communities.
+        let total: usize = peers_map.values().map(|v| v.len()).sum();
         state
             .metrics
             .connected_peers
-            .store(peers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            .store(total as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Check pending manifest fetches for this peer.
-    let pending_fetches = {
-        let map = state.pending_manifest_syncs.lock().await;
-        map.clone()
-    };
-    for community_id in pending_fetches {
-        // Try to get the public key from our local state (placeholder or existing).
-        let community_pk = {
-            let comms = state.communities.read().await;
-            comms.get(&community_id).map(|c| c.manifest.public_key)
-        };
-        if let Some(cpk) = community_pk {
-            let _ = state
-                .swarm_cmd_tx
-                .send(NetworkCommand::FetchManifest {
-                    peer_id: peer_id_str.clone(),
-                    community_id,
-                    community_pk: cpk,
-                })
-                .await;
-        }
-    }
-
-    // For communities we already have manifests for (not in pending_manifest_syncs),
-    // also request a fresh manifest fetch so we trigger history sync on reconnect.
-    // Without this, pending_manifest_syncs is empty after the first successful sync
-    // and FetchManifest is never sent on subsequent PeerConnected events, which
-    // means FetchChannelHistory is never triggered and missed messages aren't received.
-    {
-        let pending = state.pending_manifest_syncs.lock().await;
+    // Only fetch the manifest for the specific community this peer belongs to.
+    let community_pk = {
         let comms = state.communities.read().await;
-        let known_non_pending: Vec<(String, [u8; 32])> = comms
-            .iter()
-            .filter(|(id, _)| !pending.contains(*id))
-            .map(|(id, signed)| (id.clone(), signed.manifest.public_key))
-            .collect();
-        drop(comms);
-        drop(pending);
-        for (community_id, cpk) in known_non_pending {
-            let _ = state
-                .swarm_cmd_tx
-                .send(NetworkCommand::FetchManifest {
-                    peer_id: peer_id_str.clone(),
-                    community_id,
-                    community_pk: cpk,
-                })
-                .await;
-        }
+        comms.get(&community_id).map(|c| c.manifest.public_key)
+    };
+
+    if let Some(cpk) = community_pk {
+        let in_pending = {
+            let pending = state.pending_manifest_syncs.lock().await;
+            pending.contains(&community_id)
+        };
+        // Whether pending or already synced, request a fresh manifest to
+        // catch up on any missed messages since the last connection.
+        let _ = state
+            .swarm_cmd_tx
+            .send(NetworkCommand::FetchManifest {
+                peer_id: peer_id.clone(),
+                community_id: community_id.clone(),
+                community_pk: cpk,
+            })
+            .await;
+        let _ = in_pending; // suppress unused warning
     }
 
     // Fetch any DMs queued in the peer's mailbox while we were offline.
     let _ = state
         .swarm_cmd_tx
         .send(NetworkCommand::FetchMailbox {
-            peer_id: peer_id_str.clone(),
+            peer_id: peer_id.clone(),
         })
         .await;
 
-    // Re-publish owned community manifests and channel broadcasts to the newly
-    // connected peer.  This ensures relay nodes that were offline (or not yet
-    // connected) when communities/channels were created receive the data they
-    // need to serve FetchManifest to other members.
-    //
-    // We only do this when we are the community admin (our signing key == the
-    // community public key) to avoid non-admin nodes spamming gossip.
+    // Kick off DHT community peer discovery and presence announcement for all
+    // known communities via DhtHandle (non-blocking, spawned tasks).
+    if let Some(dht) = &state.dht {
+        let comms = state.communities.read().await.clone();
+        for (cid, signed) in &comms {
+            let cpk = signed.manifest.public_key;
+            let cid2 = cid.clone();
+            let dht2 = dht.clone();
+            let cmd_tx = state.swarm_cmd_tx.clone();
+            tokio::spawn(async move {
+                let peers = dht2.find_community_peers(cpk).await.unwrap_or_default();
+                if !peers.is_empty() {
+                    let peer_addrs: Vec<([u8; 32], crate::network::NodeAddr)> =
+                        peers.into_iter().map(|r| (r.node_pk, r.addr)).collect();
+                    let _ = cmd_tx
+                        .send(NetworkCommand::DiscoverAndDial {
+                            peers: peer_addrs,
+                            community_pk: cpk,
+                            community_id: cid2,
+                        })
+                        .await;
+                }
+            });
+            let dht3 = dht.clone();
+            tokio::spawn(async move { dht3.register_community_peer(cpk).await });
+        }
+    }
+
+    // Re-publish owned community manifests to the newly connected peer (admin only).
     let own_pk = state.signing_key.verifying_key().to_bytes();
     let communities_snapshot = state.communities.read().await.clone();
     let channels_snapshot = state.channels.read().await.clone();
@@ -104,8 +121,9 @@ pub(super) async fn handle_peer_connected(state: &Arc<AppState>, peer_id: String
             continue;
         }
         let topic = format!("/bitcord/community/{community_id_str}/1.0.0");
-        // Push the current signed manifest so the relay updates its NodeStore.
-        if let Ok(encoded) = NetworkEvent::ManifestUpdate(signed.clone()).encode() {
+        if let Ok(encoded) =
+            crate::model::network_event::NetworkEvent::ManifestUpdate(signed.clone()).encode()
+        {
             let _ = state
                 .swarm_cmd_tx
                 .send(NetworkCommand::Publish {
@@ -114,14 +132,15 @@ pub(super) async fn handle_peer_connected(state: &Arc<AppState>, peer_id: String
                 })
                 .await;
         }
-        // Push each channel manifest so the relay can serve wrapped keys.
         for ch_id in &signed.manifest.channel_ids {
             let ch_id_str = ch_id.to_string();
             if let Some(ch) = channels_snapshot.get(&ch_id_str) {
                 if let Ok(encoded) =
-                    NetworkEvent::ChannelManifestBroadcast(ChannelManifestBroadcastPayload {
-                        manifest: ch.clone(),
-                    })
+                    crate::model::network_event::NetworkEvent::ChannelManifestBroadcast(
+                        crate::model::network_event::ChannelManifestBroadcastPayload {
+                            manifest: ch.clone(),
+                        },
+                    )
                     .encode()
                 {
                     let _ = state
@@ -134,13 +153,11 @@ pub(super) async fn handle_peer_connected(state: &Arc<AppState>, peer_id: String
                 }
             }
         }
-        // Publish MemberJoined for all known members so relay/seed nodes
-        // populate their NodeStore member list.  Without this, joiners
-        // that fetch the manifest from a seed would get an empty member
-        // list (the admin was never announced via MemberJoined gossip).
         if let Some(member_list) = members_snapshot.get(community_id_str) {
             for member in member_list.values() {
-                if let Ok(encoded) = NetworkEvent::MemberJoined(member.clone()).encode() {
+                if let Ok(encoded) =
+                    crate::model::network_event::NetworkEvent::MemberJoined(member.clone()).encode()
+                {
                     let _ = state
                         .swarm_cmd_tx
                         .send(NetworkCommand::Publish {
@@ -157,11 +174,13 @@ pub(super) async fn handle_peer_connected(state: &Arc<AppState>, peer_id: String
 /// Handle a `PeerDisconnected` swarm event.
 pub(super) async fn handle_peer_disconnected(state: &Arc<AppState>, peer_id: String) {
     info!(%peer_id, "peer disconnected");
-    let peer_id_str = peer_id;
-    let mut peers = state.connected_peers.write().await;
-    peers.retain(|p| p.peer_id != peer_id_str);
+    let mut peers_map = state.connected_peers.write().await;
+    for list in peers_map.values_mut() {
+        list.retain(|p| p.peer_id != peer_id);
+    }
+    let total: usize = peers_map.values().map(|v| v.len()).sum();
     state
         .metrics
         .connected_peers
-        .store(peers.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        .store(total as u64, std::sync::atomic::Ordering::Relaxed);
 }

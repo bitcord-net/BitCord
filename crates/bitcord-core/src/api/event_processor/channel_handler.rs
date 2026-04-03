@@ -515,8 +515,15 @@ pub(super) async fn handle_channel_key_rotation(
     // Fetch an updated full manifest from any connected peer so we receive the
     // new key bytes (E2EE: wrapped per-member in ChannelManifest responses).
     let connected_peer = {
-        let peers = state.connected_peers.read().await;
-        peers.first().map(|p| p.peer_id.clone())
+        let peers_map = state.connected_peers.read().await;
+        let list = peers_map
+            .get(&community_id_str)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        list.iter()
+            .find(|p| p.is_admin)
+            .or_else(|| list.first())
+            .map(|p| p.peer_id.clone())
     };
     if let Some(peer_id) = connected_peer {
         let _ = state

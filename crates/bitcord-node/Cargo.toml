@@ -1,6 +1,6 @@
 [package]
 name = "bitcord-node"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["BitCord Contributors"]
 description = "Standalone node binary for the BitCord encrypted P2P communication platform"

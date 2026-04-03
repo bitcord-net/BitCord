@@ -34,11 +34,13 @@ pub(super) fn register_community_methods(
     module.register_async_method("community_create", |params, ctx, _| async move {
         let p: CreateCommunityParams = params.parse().map_err(|e| invalid_params(e.to_string()))?;
 
-        // When the embedded server is off this node cannot act as a seed, so
-        // require at least one external seed node so peers can reach the community.
-        if !ctx.config.read().await.server_enabled && p.seed_nodes.is_empty() {
+        // When the node is GossipClient it cannot act as a seed, so require
+        // at least one external seed node so peers can reach the community.
+        if ctx.config.read().await.node_mode == crate::config::NodeMode::GossipClient
+            && p.seed_nodes.is_empty()
+        {
             return Err(forbidden(
-                "embedded server is disabled — add at least one external seed node address",
+                "GossipClient mode — add at least one external seed node address",
             ));
         }
 
@@ -126,6 +128,7 @@ pub(super) fn register_community_methods(
             version: m.version,
             created_at: m.created_at,
             reachable: true,
+            seeded: !m.seed_nodes.is_empty(),
         };
         let community_id = m.id.to_string();
         let community_id_typed = m.id.clone(); // capture before signed is moved
@@ -255,6 +258,14 @@ pub(super) fn register_community_methods(
                     })
                     .await;
             }
+        }
+
+        // Announce this node's presence in the new community to the DHT so
+        // peers can discover us.  Seedless communities rely entirely on DHT
+        // peer discovery since there is no seed node to act as a hub.
+        if let Some(dht) = &ctx.dht {
+            let dht = dht.clone();
+            tokio::spawn(async move { dht.register_community_peer(pk_bytes).await });
         }
 
         {
@@ -443,6 +454,7 @@ pub(super) fn register_community_methods(
             version: m.version,
             created_at: m.created_at,
             reachable: invite.seed_nodes.is_empty(),
+            seeded: !invite.seed_nodes.is_empty(),
         };
         let version = m.version;
         let channel_ids_for_sub: Vec<String> =
@@ -534,7 +546,10 @@ pub(super) fn register_community_methods(
         {
             let mut members = ctx.members.write().await;
             let list = members.entry(community_id_str.clone()).or_default();
-            list.insert(self_member_join.user_id.to_string(), self_member_join);
+            list.insert(
+                self_member_join.user_id.to_string(),
+                self_member_join.clone(),
+            );
             save_table(
                 &ctx.data_dir.join("members.json"),
                 &*members,
@@ -549,6 +564,21 @@ pub(super) fn register_community_methods(
             },
         ));
 
+        // Publish MemberJoined on the community topic so that the admin and
+        // other peers learn about the new member immediately.  Without this,
+        // the admin never wraps channel keys for the joiner, and the joiner
+        // stays invisible in the member list until the next full sync.
+        let community_topic_pub = format!("/bitcord/community/{community_id_str}/1.0.0");
+        if let Ok(encoded) = NetworkEvent::MemberJoined(self_member_join.clone()).encode() {
+            let _ = ctx
+                .swarm_cmd_tx
+                .send(NetworkCommand::Publish {
+                    topic: community_topic_pub,
+                    data: encoded,
+                })
+                .await;
+        }
+
         // Queue manifest sync for when we connect to seed nodes.
         {
             let mut pending = ctx.pending_manifest_syncs.lock().await;
@@ -558,8 +588,14 @@ pub(super) fn register_community_methods(
         }
 
         // Proactively try to fetch from any ALREADY connected peers.
-        let connected_peers = ctx.connected_peers.read().await.clone();
-        for peer in connected_peers {
+        let peers_for_community = {
+            let peers_map = ctx.connected_peers.read().await;
+            peers_map
+                .get(&community_id_str)
+                .cloned()
+                .unwrap_or_default()
+        };
+        for peer in peers_for_community {
             let _ = ctx
                 .swarm_cmd_tx
                 .send(NetworkCommand::FetchManifest {
@@ -609,6 +645,7 @@ pub(super) fn register_community_methods(
         // Dial each seed node.
         let seed_nodes_for_fetch = invite.seed_nodes.clone();
         let swarm_cmd_tx = ctx.swarm_cmd_tx.clone();
+        let community_id_for_dht = community_id_str.clone();
         tokio::spawn(async move {
             for addr_str in &seed_nodes_for_fetch {
                 let Ok(addr) = addr_str.parse::<crate::network::NodeAddr>() else {
@@ -622,11 +659,36 @@ pub(super) fn register_community_methods(
                     .send(NetworkCommand::Dial {
                         addr,
                         is_seed: true,
-                        join_community: Some((pk_bytes, community_id_str.clone())),
+                        join_community: Some((pk_bytes, community_id_for_dht.clone())),
                         join_community_password: p.hosting_password.clone(),
                         cert_fingerprint: invite_cert_fingerprint,
                     })
                     .await;
+            }
+            // Announce our presence and discover existing peers via DHT.
+            // This is the primary discovery mechanism for seedless communities
+            // and supplements seed-based discovery for seeded ones.
+            if let Some(dht) = &ctx.dht {
+                let dht_ann = dht.clone();
+                tokio::spawn(async move { dht_ann.register_community_peer(pk_bytes).await });
+                let dht_disc = dht.clone();
+                tokio::spawn(async move {
+                    let peers = dht_disc
+                        .find_community_peers(pk_bytes)
+                        .await
+                        .unwrap_or_default();
+                    if !peers.is_empty() {
+                        let peer_addrs: Vec<([u8; 32], crate::network::NodeAddr)> =
+                            peers.into_iter().map(|r| (r.node_pk, r.addr)).collect();
+                        let _ = swarm_cmd_tx
+                            .send(NetworkCommand::DiscoverAndDial {
+                                peers: peer_addrs,
+                                community_pk: pk_bytes,
+                                community_id: community_id_for_dht,
+                            })
+                            .await;
+                    }
+                });
             }
         });
 
@@ -844,6 +906,7 @@ pub(super) fn register_community_methods(
                     version: m.version,
                     created_at: m.created_at,
                     reachable,
+                    seeded: !m.seed_nodes.is_empty(),
                 }
             })
             .collect();
@@ -872,6 +935,7 @@ pub(super) fn register_community_methods(
             version: m.version,
             created_at: m.created_at,
             reachable,
+            seeded: !m.seed_nodes.is_empty(),
         };
         Ok::<super::super::types::CommunityInfo, ErrorObjectOwned>(info)
     })?;

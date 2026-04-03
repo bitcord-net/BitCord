@@ -18,6 +18,7 @@ use crate::{
     model::{channel::ChannelManifest, community::SignedManifest, membership::MembershipRecord},
     state::message_log::LogEntry,
 };
+use bitcord_dht::CommunityPeerRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ulid::Ulid;
@@ -129,6 +130,22 @@ pub enum ClientRequest {
         channel_id: Ulid,
         entries: Vec<LogEntry>,
     },
+
+    /// Store a community peer record on this node.
+    ///
+    /// Announces that `node_pk` is reachable at `addr` and is a member of
+    /// `community_pk`.  No authentication required — public DHT operation.
+    StoreCommunityPeer {
+        community_pk: [u8; 32],
+        node_pk: [u8; 32],
+        addr: NodeAddr,
+    },
+
+    /// Ask this node for all known peers in `community_pk`.
+    ///
+    /// Returns `NodeResponse::CommunityPeers`.
+    /// No authentication required — public DHT operation.
+    FindCommunityPeers { community_pk: [u8; 32] },
 }
 
 // ── Node → Client (response) ─────────────────────────────────────────────────
@@ -178,6 +195,12 @@ pub enum NodeResponse {
 
     /// Community data or history batch accepted.
     PushAck,
+
+    /// Community peer record stored successfully (response to `StoreCommunityPeer`).
+    CommunityPeerAck,
+
+    /// Known peers in a community (response to `FindCommunityPeers`).
+    CommunityPeers(Vec<CommunityPeerRecord>),
 
     /// Error response; `code` mirrors HTTP semantics (400 = bad request, 403 = forbidden, …).
     Error { code: u16, msg: String },

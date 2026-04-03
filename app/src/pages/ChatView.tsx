@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useParams } from "react-router-dom";
+import { useIsMobile } from "../hooks/useIsMobile";
 import { Loader2, Volume2, MicOff, Megaphone } from "lucide-react";
 import { useCommunitiesStore } from "../store/communities";
 import { useMessagesStore } from "../store/messages";
@@ -275,6 +276,7 @@ export function ChatView() {
     memberList.length > 0 &&
     !myMember?.roles.some((r) => r === "admin" || r === "moderator");
 
+  const isMobile = useIsMobile();
   const progress = chid ? syncProgress[chid] : undefined;
   const isSyncing = progress !== undefined && progress < 1.0;
 
@@ -303,7 +305,7 @@ export function ChatView() {
   if (channel.kind === "voice") {
     return (
       <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-        <ChannelHeader channel={channel} memberCount={memberList.length} />
+        {!isMobile && <ChannelHeader channel={channel} memberCount={memberList.length} />}
         <div
           style={{
             flex: 1,
@@ -362,7 +364,7 @@ export function ChatView() {
         overflow: "hidden",
       }}
     >
-      <ChannelHeader channel={channel} memberCount={memberList.length} />
+      {!isMobile && <ChannelHeader channel={channel} memberCount={memberList.length} />}
 
       {isSyncing && (
         <div

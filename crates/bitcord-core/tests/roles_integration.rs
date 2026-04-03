@@ -18,7 +18,6 @@ use bitcord_core::{
         types::{ChannelId, CommunityId, UserId},
     },
     network::NetworkHandle,
-    node::dht::Dht,
     resource::metrics::NodeMetrics,
     state::MessageLog,
 };
@@ -54,8 +53,7 @@ fn make_test_node(tmp: &TempDir) -> TestNode {
     let signing_key = SigningKey::from_bytes(&identity.signing_key_bytes());
     let message_log = MessageLog::new();
     let identity_arc = Arc::new(identity);
-    let dht = Arc::new(Dht::new(identity_arc.verifying_key().to_bytes(), None));
-    let (swarm_cmd_tx, _) = NetworkHandle::spawn(Arc::clone(&identity_arc), vec![], None, dht);
+    let (swarm_cmd_tx, _) = NetworkHandle::spawn(Arc::clone(&identity_arc), vec![], None);
     let metrics = Arc::new(NodeMetrics::default());
     let config = NodeConfig {
         data_dir: tmp.path().to_path_buf(),
@@ -76,6 +74,7 @@ fn make_test_node(tmp: &TempDir) -> TestNode {
         None,
         None,
         None, // no TLS server in tests
+        None, // no DHT in tests
     );
     TestNode {
         state: Arc::new(state),

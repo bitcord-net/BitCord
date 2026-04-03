@@ -16,11 +16,12 @@ use tracing::{info, warn};
 
 use crate::{
     api::{AppState, process_swarm_events},
-    config::NodeConfig,
+    config::{NodeConfig, NodeMode},
     crypto::encrypted_io::{derive_table_key, load_or_create_salt},
+    dht::{DhtConfig, DhtHandle},
     identity::NodeIdentity,
     network::{NetworkCommand, NetworkHandle, NodeAddr, tls::NodeTlsCert},
-    node::{NodeServicesConfig, dht::Dht, server::NodeServer, store::NodeStore},
+    node::{NodeServicesConfig, server::NodeServer, store::NodeStore},
     resource::{
         connection_limiter::ConnectionLimiter,
         metrics::{MetricsUpdate, NodeMetrics, spawn_metrics_task},
@@ -43,9 +44,6 @@ pub struct NodeInitConfig {
     pub config_path: PathBuf,
     /// Password required for new community registrations; `None` = open node.
     pub join_password: Option<String>,
-    /// Whether to bind and serve the QUIC server.
-    /// Set to `false` for client-only (Tauri) mode.
-    pub server_enabled: bool,
     /// Fall back to an OS-assigned port if the configured port is unavailable.
     /// Enabled for Tauri embedded nodes; disabled for the headless binary.
     pub fallback_to_random_port: bool,
@@ -70,15 +68,15 @@ pub struct NodeInitResult {
     /// The node binary uses these to sync BandwidthLimiter stats after init.
     pub bw_in: Arc<AtomicU64>,
     pub bw_out: Arc<AtomicU64>,
-    /// Running QUIC server handle; `None` when `server_enabled = false`.
+    /// Running QUIC server handle; `None` when node is `GossipClient`.
     pub quic_server: Option<Arc<NodeServer>>,
-    /// Actual bound QUIC port; `None` when `server_enabled = false`.
+    /// Actual bound QUIC port; `None` when node is `GossipClient`.
     pub quic_port: Option<u16>,
     /// Raw TLS cert fingerprint bytes for `NodeClient::connect` in Tauri.
     pub cert_fingerprint: Option<[u8; 32]>,
     /// Hex fingerprint string for logging in the headless node binary.
     pub cert_fingerprint_hex: Option<String>,
-    /// JoinHandle for the QUIC serve loop; `None` when `server_enabled = false`.
+    /// JoinHandle for the QUIC serve loop; `None` when node is `GossipClient`.
     pub quic_task: Option<tokio::task::JoinHandle<()>>,
     /// JoinHandle for the swarm event processor; await for graceful shutdown.
     pub event_proc: tokio::task::JoinHandle<()>,
@@ -98,11 +96,13 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
         mut config,
         config_path,
         join_password,
-        server_enabled,
         fallback_to_random_port,
         dht_self_addr,
         store_db_path,
     } = cfg;
+
+    let node_mode = config.node_mode.clone();
+    let server_enabled = node_mode != NodeMode::GossipClient;
 
     // ── 1. Table encryption key ────────────────────────────────────────────────
     let encryption_key: Option<[u8; 32]> =
@@ -135,50 +135,44 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
     }
 
     // ── 4. Persistent store + message log ──────────────────────────────────────
-    let store = Arc::new(NodeStore::open(&store_db_path).context("open node store")?);
+    let store =
+        Arc::new(NodeStore::open(&store_db_path, encryption_key).context("open node store")?);
     let message_log = MessageLog::new();
 
-    // ── 5. DHT + background maintenance tasks ──────────────────────────────────
-    let dht = Arc::new(Dht::new(node_pk, dht_self_addr));
+    // ── 5. DHT handle (Peer and HeadlessSeed modes only) ──────────────────────
+    let dht: Option<Arc<DhtHandle>> = if server_enabled {
+        let dht_store_path = config.data_dir.join("dht.redb");
+        let handle = DhtHandle::new(DhtConfig {
+            node_pk,
+            self_addr: dht_self_addr,
+            store_path: dht_store_path,
+            identity: Arc::clone(&identity),
+        })
+        .await
+        .context("init DHT")?;
+        Some(Arc::new(handle))
+    } else {
+        info!("DHT disabled (GossipClient mode)");
+        None
+    };
 
-    match store.all_mailbox_recipients() {
-        Ok(recipients) => {
-            let count = recipients.len();
-            for pk in recipients {
-                dht.announce_mailbox(pk);
-            }
-            if count > 0 {
-                info!(count, "DHT pre-populated from persistent mailbox store");
-            }
-        }
-        Err(e) => warn!("failed to pre-populate DHT from store: {e}"),
-    }
-
-    {
-        let dht_expiry = Arc::clone(&dht);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
-            loop {
-                interval.tick().await;
-                dht_expiry.expire_records();
-            }
-        });
-    }
-
-    {
-        let dht_repub = Arc::clone(&dht);
-        let store_repub = Arc::clone(&store);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                interval.tick().await;
-                if let Ok(recipients) = store_repub.all_mailbox_recipients() {
-                    for pk in recipients {
-                        dht_repub.announce_mailbox(pk);
-                    }
+    // Pre-populate DHT mailbox records from persistent store.
+    if let Some(dht) = &dht {
+        match store.all_mailbox_recipients() {
+            Ok(recipients) => {
+                let count = recipients.len();
+                for pk in recipients {
+                    dht.add_mailbox_record(
+                        pk,
+                        NodeAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                    );
+                }
+                if count > 0 {
+                    info!(count, "DHT pre-populated from persistent mailbox store");
                 }
             }
-        });
+            Err(e) => warn!("failed to pre-populate DHT from store: {e}"),
+        }
     }
 
     // ── 6. Metrics ─────────────────────────────────────────────────────────────
@@ -205,7 +199,7 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
     // ── 8. NetworkCommand channel ──────────────────────────────────────────────
     let (cmd_tx, cmd_rx) = mpsc::channel::<NetworkCommand>(256);
 
-    // ── 9. QUIC server (optional) ──────────────────────────────────────────────
+    // ── 9. QUIC server (Peer and HeadlessSeed modes only) ─────────────────────
     let limiter = Arc::new(ConnectionLimiter::new(config.max_connections.max(10)));
     let (quic_server_opt, quic_port_opt, quic_task_opt, server_push_tx_opt, local_listen_addrs) =
         if server_enabled {
@@ -213,7 +207,7 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
 
             let make_services = || NodeServicesConfig {
                 store: Arc::clone(&store),
-                dht: Arc::clone(&dht),
+                dht: dht.clone(),
                 limiter: Arc::clone(&limiter),
                 node_pk,
                 swarm_cmd_tx: cmd_tx.clone(),
@@ -255,6 +249,12 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
                 }
             }
 
+            // Update DHT self-address with the bound port.
+            if let Some(dht) = &dht {
+                let ip = quic_local_addr.ip();
+                dht.update_self_addr(NodeAddr::new(ip, actual_port));
+            }
+
             let server_push_tx = quic_server.push_sender();
             let quic_server_arc = Arc::new(quic_server);
             let quic_for_task = Arc::clone(&quic_server_arc);
@@ -271,7 +271,7 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
                 vec![local_listen_addr],
             )
         } else {
-            info!("QUIC server disabled (client-only mode)");
+            info!("QUIC server disabled (GossipClient mode)");
             (None, None, None, None, vec![])
         };
 
@@ -281,21 +281,36 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
         local_listen_addrs,
         cmd_rx,
         server_push_tx_opt,
-        Arc::clone(&dht),
     );
     info!("NetworkHandle gossip task started");
 
     // ── 11. NAT traversal (background) ────────────────────────────────────────
     if let Some(port) = quic_port_opt {
         let nat_cmd_tx = cmd_tx.clone();
+        let dht_nat = dht.clone();
         tokio::spawn(async move {
             if let Some(ext_addr) = crate::network::nat::discover_external_addr(port).await {
                 let addr_str = format!("{}:{}", ext_addr.ip(), ext_addr.port());
+                // Update DHT self-address with the externally discovered address.
+                if let Some(dht) = &dht_nat {
+                    dht.update_self_addr(NodeAddr::new(ext_addr.ip(), ext_addr.port()));
+                }
                 let _ = nat_cmd_tx
                     .send(NetworkCommand::AddListenAddr(addr_str))
                     .await;
             }
         });
+    }
+
+    // ── 11b. mDNS LAN discovery ───────────────────────────────────────────────
+    {
+        let own_pk_hex: String = node_pk.iter().map(|b| format!("{b:02x}")).collect();
+        crate::network::mdns::spawn_mdns_task(
+            own_pk_hex,
+            quic_port_opt.unwrap_or(0),
+            cmd_tx.clone(),
+            node_mode == NodeMode::GossipClient,
+        );
     }
 
     // ── 12. AppState ───────────────────────────────────────────────────────────
@@ -312,38 +327,50 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
         Some(Arc::clone(&store)),
         encryption_key,
         Some(cert_fingerprint_hex.clone()),
+        dht.clone(),
     ));
 
     // ── 13. Preferred mailbox re-announcement (hourly) ─────────────────────────
-    // Re-propagates the user's preferred DM mailbox preference to the DHT so
-    // the record doesn't expire (TTL = 24 h, re-announced every 1 h).
-    // The first tick fires immediately; if no peers are connected yet the
-    // propagation is a silent no-op but the local DHT entry is still set.
-    {
-        let app_state_repub = Arc::clone(&app_state);
-        let our_x25519_pk = {
-            let sk = identity.signing_key_bytes();
-            crate::identity::NodeIdentity::from_signing_key_bytes(&sk).x25519_public_key_bytes()
-        };
+    // Re-propagates the user's preferred DM mailbox preference to the DHT.
+    // Skipped for GossipClient (no DHT) and HeadlessSeed (no user identity).
+    if node_mode == NodeMode::Peer {
+        if let Some(dht_repub) = dht.clone() {
+            let app_state_repub = Arc::clone(&app_state);
+            let our_x25519_pk = {
+                let sk = identity.signing_key_bytes();
+                crate::identity::NodeIdentity::from_signing_key_bytes(&sk).x25519_public_key_bytes()
+            };
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    let preferred = app_state_repub
+                        .config
+                        .read()
+                        .await
+                        .preferred_mailbox_node
+                        .clone();
+                    if preferred.is_some() {
+                        dht_repub.register_mailbox(our_x25519_pk).await;
+                    }
+                }
+            });
+        }
+    }
+
+    // ── 14. Community presence re-announcement (hourly) ───────────────────────
+    // Re-announces this node's presence in all joined communities to the DHT.
+    // Also persists the in-memory community peer snapshot to the DHT store.
+    if let Some(dht_comm) = dht.clone() {
+        let store_comm = Arc::clone(&store);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // first tick fires immediately — skip it
             loop {
                 interval.tick().await;
-                let preferred = app_state_repub
-                    .config
-                    .read()
-                    .await
-                    .preferred_mailbox_node
-                    .clone();
-                if let Some(addr_str) = preferred {
-                    if let Ok(addr) = addr_str.parse::<crate::network::NodeAddr>() {
-                        let _ = app_state_repub
-                            .swarm_cmd_tx
-                            .send(crate::network::NetworkCommand::AnnouncePreferredMailbox {
-                                user_pk: our_x25519_pk,
-                                addr,
-                            })
-                            .await;
+                if let Ok(communities) = store_comm.all_communities() {
+                    for community_pk in communities {
+                        dht_comm.register_community_peer(community_pk).await;
                     }
                 }
             }
@@ -354,8 +381,7 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
     let state_for_events = Arc::clone(&app_state);
     let event_proc = tokio::spawn(process_swarm_events(event_rx, state_for_events));
 
-    // ── 16. Migration + bootstrap ──────────────────────────────────────────────
-    app_state.migrate_tables_to_encrypted().await;
+    // ── 16. Bootstrap ──────────────────────────────────────────────────────────
     let _ = app_state.bootstrap_network().await;
 
     Ok(NodeInitResult {

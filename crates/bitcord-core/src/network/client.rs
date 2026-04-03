@@ -48,6 +48,7 @@ use crate::{
     },
     state::message_log::LogEntry,
 };
+use bitcord_dht::CommunityPeerRecord;
 
 /// Default channel capacity for the push-event receiver.
 const PUSH_CHANNEL_CAPACITY: usize = 512;
@@ -305,6 +306,55 @@ impl NodeClient {
                 bail!("store_dht_record failed (code={code}): {msg}")
             }
             other => bail!("unexpected store_dht_record response: {other:?}"),
+        }
+    }
+
+    // ── Community peer DHT ────────────────────────────────────────────────
+
+    /// Store a community peer record on the remote node.
+    ///
+    /// Tells the node that `node_pk` is a member of `community_pk` and is
+    /// reachable at `addr`.  Does not require prior authentication.
+    pub async fn store_community_peer(
+        &self,
+        community_pk: [u8; 32],
+        node_pk: [u8; 32],
+        addr: NodeAddr,
+    ) -> Result<()> {
+        let resp = self
+            .mgr
+            .request(&ClientRequest::StoreCommunityPeer {
+                community_pk,
+                node_pk,
+                addr,
+            })
+            .await?;
+        match resp {
+            NodeResponse::CommunityPeerAck => Ok(()),
+            NodeResponse::Error { code, msg } => {
+                bail!("store_community_peer failed (code={code}): {msg}")
+            }
+            other => bail!("unexpected store_community_peer response: {other:?}"),
+        }
+    }
+
+    /// Ask the remote node for all known peers in `community_pk`.
+    ///
+    /// Does not require prior authentication.
+    pub async fn find_community_peers(
+        &self,
+        community_pk: [u8; 32],
+    ) -> Result<Vec<CommunityPeerRecord>> {
+        let resp = self
+            .mgr
+            .request(&ClientRequest::FindCommunityPeers { community_pk })
+            .await?;
+        match resp {
+            NodeResponse::CommunityPeers(records) => Ok(records),
+            NodeResponse::Error { code, msg } => {
+                bail!("find_community_peers failed (code={code}): {msg}")
+            }
+            other => bail!("unexpected find_community_peers response: {other:?}"),
         }
     }
 

@@ -22,7 +22,7 @@ export const useIdentityStore = create<IdentityState>((set) => ({
         rpcClient.identityGet(),
         rpcClient.nodeGetConfig(),
       ]);
-      set({ identity, serverEnabled: config.server_enabled, isLoaded: true });
+      set({ identity, serverEnabled: config.node_mode !== "gossip_client", isLoaded: true });
     } catch {
       set({ identity: null, serverEnabled: false, isLoaded: true });
     }

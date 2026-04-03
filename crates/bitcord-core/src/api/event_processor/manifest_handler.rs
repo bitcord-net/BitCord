@@ -4,6 +4,7 @@ use ed25519_dalek::Signer as _;
 use tracing::{debug, info, warn};
 
 use super::super::push_broadcaster::{CommunityEventData, PushEvent};
+use super::super::types::PeerSummary;
 use super::super::{AppState, DmPeerInfo, remove_community_local, save_table};
 use crate::{
     crypto::channel_keys::ChannelKey,
@@ -71,6 +72,32 @@ pub(super) async fn handle_manifest_received(
             &*communities,
             state.encryption_key.as_ref(),
         );
+    }
+
+    // Register the peer that responded to FetchManifest into connected_peers for this
+    // community.  This is the primary path for mDNS/LAN peers, which connect without
+    // community context and are probed via FetchManifest for all joined communities.
+    {
+        let admin_pk_hex: String = manifest
+            .manifest
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let is_admin = admin_pk_hex == from;
+        let mut peers_map = state.connected_peers.write().await;
+        let list = peers_map.entry(community_id_str.clone()).or_default();
+        if !list.iter().any(|p| p.peer_id == from) {
+            list.push(PeerSummary {
+                peer_id: from.clone(),
+                community_id: community_id_str.clone(),
+                is_admin,
+                addresses: vec![],
+                latency_ms: None,
+                relay_capable: false,
+                reputation: 0,
+            });
+        }
     }
 
     // Store received channel manifests and evict any locally cached channels
@@ -247,9 +274,12 @@ pub(super) async fn handle_manifest_received(
             );
             // Try fetching from a different peer than the one we just used.
             let retry_peer = {
-                let peers = state.connected_peers.read().await;
-                peers
-                    .iter()
+                let peers_map = state.connected_peers.read().await;
+                let list = peers_map
+                    .get(&community_id_str)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                list.iter()
                     .find(|p| p.peer_id != from)
                     .map(|p| p.peer_id.clone())
             };
@@ -592,9 +622,24 @@ pub(super) async fn handle_manifest_received(
             let log = state.message_log.lock().await;
             log.len(ch_id)
         };
+        // Prefer the admin peer for history; fall back to any community peer.
+        let fetch_peer = {
+            let peers_map = state.connected_peers.read().await;
+            let list = peers_map
+                .get(&community_id_str)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            list.iter()
+                .find(|p| p.is_admin)
+                .or_else(|| list.iter().find(|p| p.peer_id != from))
+                .or_else(|| list.first())
+                .map(|p| p.peer_id.clone())
+                .unwrap_or_else(|| from.clone())
+        };
+
         info!(
             channel_id = ch_id,
-            %from,
+            peer_id = %fetch_peer,
             %since_seq,
             "triggering history catch-up from peer"
         );
@@ -610,7 +655,7 @@ pub(super) async fn handle_manifest_received(
         let _ = state
             .swarm_cmd_tx
             .send(NetworkCommand::FetchChannelHistory {
-                peer_id: from.clone(),
+                peer_id: fetch_peer,
                 community_id: community_id_str.clone(),
                 community_pk,
                 channel_id: ch_id.clone(),

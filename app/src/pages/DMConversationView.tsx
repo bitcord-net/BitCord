@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useParams } from "react-router-dom";
+import { useIsMobile } from "../hooks/useIsMobile";
 import { Loader2, Lock, Smile, Reply, Edit2, Copy } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -423,6 +424,7 @@ export function DMConversationView() {
   const isAtBottomRef = useRef(true);
 
   // Resolve peer display name: community members → stored conversation → truncated ID
+  const isMobile = useIsMobile();
   const peerDisplayName = useMemo(() => {
     if (!peerId) return "Unknown";
     for (const memberList of Object.values(allMembers)) {
@@ -641,8 +643,8 @@ export function DMConversationView() {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <style>{`@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }`}</style>
-      {/* Header */}
-      <div
+      {/* Header — hidden on mobile (MobileChannelHeader handles navigation) */}
+      {!isMobile && <div
         style={{
           display: "flex",
           alignItems: "center",
@@ -686,7 +688,7 @@ export function DMConversationView() {
           <Lock size={12} aria-hidden="true" style={{ color: "var(--color-bc-muted)" }} />
           <span style={{ fontSize: "0.6875rem", color: "var(--color-bc-muted)" }}>End-to-End Encrypted</span>
         </div>
-      </div>
+      </div>}
 
       {/* Message list */}
       {isInitialLoading ? (

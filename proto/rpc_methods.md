@@ -201,7 +201,6 @@ All fields optional; only provided fields are updated.
   "max_connections"?: 50,
   "storage_limit_mb"?: 512,
   "bandwidth_limit_kbps"?: null,
-  "is_seed_node"?: false,
   "seed_priority"?: 0,
   "mdns_enabled"?: true,
   "log_level"?: "info"

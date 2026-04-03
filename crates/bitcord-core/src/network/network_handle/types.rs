@@ -23,6 +23,9 @@ pub(crate) type SeedPeerInfo = (
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 /// Commands sent from the application layer to the network layer.
+///
+/// This enum is **gossip-only**: all DHT operations are performed directly
+/// through [`crate::dht::DhtHandle`] and never pass through `NetworkCommand`.
 #[derive(Debug)]
 pub enum NetworkCommand {
     /// Dial a peer at the given address.
@@ -40,8 +43,7 @@ pub enum NetworkCommand {
         /// Password for private nodes — forwarded in the `JoinCommunity` request.
         join_community_password: Option<String>,
         /// SHA-256 fingerprint of the remote node's TLS certificate.
-        /// `[0u8; 32]` means TOFU mode (accept any certificate), used for
-        /// DHT/bootstrap connections where the fingerprint is unknown.
+        /// `[0u8; 32]` means TOFU mode (accept any certificate).
         cert_fingerprint: [u8; 32],
     },
     /// Subscribe to a pub/sub topic (e.g. `/bitcord/channel/<id>/1.0.0`).
@@ -50,11 +52,16 @@ pub enum NetworkCommand {
     Unsubscribe(String),
     /// Publish data on a pub/sub topic.
     Publish { topic: String, data: Vec<u8> },
-    /// Send a direct message to a peer (peer_id = hex-encoded Ed25519 public key).
+    /// Send a direct message to a peer.
+    ///
+    /// `mailbox_addr` is pre-resolved by the caller via `DhtHandle`; the gossip
+    /// layer performs direct delivery only.
     SendDm {
         peer_id: String,
         recipient_x25519_pk: [u8; 32],
         envelope: DmEnvelope,
+        /// Pre-resolved mailbox address from DhtHandle. `None` = direct-only.
+        mailbox_addr: Option<NodeAddr>,
     },
     /// Request a community manifest from a peer.
     FetchManifest {
@@ -70,32 +77,21 @@ pub enum NetworkCommand {
         channel_id: String,
         since_seq: u64,
     },
-    /// Inject an externally discovered listen address (e.g., from NAT traversal)
-    /// so that the event processor can add it to invite links.
+    /// Inject an externally discovered listen address (e.g., from NAT traversal).
     AddListenAddr(String),
     /// Notify the event processor that a community was joined via the QUIC server.
     NotifyCommunityJoined([u8; 32], String),
-    /// Propagate a mailbox record to the K closest peers via `StoreDhtRecord`.
-    ///
-    /// Used after a DM is stored to spread the routing record across the network
-    /// so other nodes can find the mailbox-holding node via iterative lookup.
-    PropagateDhtRecord {
-        user_pk: [u8; 32],
-        self_addr: NodeAddr,
-    },
-    /// Announce a preferred mailbox node for `user_pk` to the local DHT and
-    /// propagate it to the K closest peers.
-    ///
-    /// Unlike `PropagateDhtRecord` (which is sent by the server node that
-    /// physically holds the mailbox), this command is sent by the *client* to
-    /// claim a preferred hosting node before any DM has been stored there.
-    AnnouncePreferredMailbox { user_pk: [u8; 32], addr: NodeAddr },
     /// Fetch all queued DMs from a peer's mailbox.
-    ///
-    /// Sent when a peer connects so the client pulls any DMs that arrived while
-    /// it was offline.  The network handle calls `GetDms { since_seq: 0 }` on
-    /// the peer and emits `DmReceived` for every entry returned.
     FetchMailbox { peer_id: String },
+    /// Dial a set of DHT-discovered community peers and register them for gossip.
+    ///
+    /// The caller has already performed the DHT query via `DhtHandle`; this
+    /// command just dials each returned peer and joins the community.
+    DiscoverAndDial {
+        peers: Vec<([u8; 32], NodeAddr)>,
+        community_pk: [u8; 32],
+        community_id: String,
+    },
     /// Shut down the network handle.
     Shutdown,
 }
@@ -106,7 +102,13 @@ pub enum NetworkCommand {
 #[derive(Debug)]
 pub enum NetworkEvent {
     /// A new peer connection was established (peer_id = hex-encoded Ed25519 public key).
-    PeerConnected(String),
+    PeerConnected {
+        peer_id: String,
+        community_id: String,
+    },
+    /// A peer connected via mDNS/LAN without community context.
+    /// The event processor will probe all joined communities with FetchManifest.
+    LanPeerConnected { peer_id: String },
     /// A peer connection was closed.
     PeerDisconnected(String),
     /// A pub/sub message was received on the given topic.
@@ -140,20 +142,20 @@ pub enum NetworkEvent {
     /// A community was joined via the QUIC server.
     CommunityJoined([u8; 32], String),
     /// Auto-join to a seed node failed (e.g. invalid hosting password).
-    /// Carries the community_id so the local placeholder can be removed.
     CommunityJoinFailed {
         community_id: String,
         reason: String,
     },
-    /// A `FetchManifest` request returned 404 — the queried peer no longer
-    /// hosts this community.  Used to detect community deletion when an
-    /// offline node reconnects and all known peers have purged the manifest.
+    /// A `FetchManifest` request returned 404.
     ManifestNotFound {
         community_id: String,
         peer_id: String,
     },
     /// A seed peer connected for a specific community.
-    SeedPeerConnected { community_id: String },
+    SeedPeerConnected {
+        community_id: String,
+        peer_id: String,
+    },
     /// A seed peer disconnected from a specific community.
     SeedPeerDisconnected { community_id: String },
     /// A network-level error occurred.

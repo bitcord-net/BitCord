@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, time::interval};
-use tracing::debug;
+use tracing::trace;
 
 /// A snapshot of node-level operational metrics.
 #[derive(Debug, Clone, Default)]
@@ -78,7 +78,7 @@ pub fn spawn_metrics_task(
                     metrics.bandwidth_in_kbps.store(bw_in, Ordering::Relaxed);
                     metrics.bandwidth_out_kbps.store(bw_out, Ordering::Relaxed);
 
-                    debug!(
+                    trace!(
                         peers = metrics.connected_peers.load(Ordering::Relaxed),
                         channels = metrics.stored_channels.load(Ordering::Relaxed),
                         disk_mb = metrics.disk_usage_mb.load(Ordering::Relaxed),

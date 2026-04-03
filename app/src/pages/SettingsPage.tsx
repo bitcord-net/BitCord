@@ -419,7 +419,6 @@ function NodeTab() {
   const [saveMsg, setSaveMsg] = useState("");
 
   // local edits
-  const [isSeedNode, setIsSeedNode] = useState(false);
   const [storageMb, setStorageMb] = useState(512);
   const [bandwidthKbps, setBandwidthKbps] = useState<number | null>(null);
   const [seedNodes, setSeedNodes] = useState<string[]>([]);
@@ -428,7 +427,6 @@ function NodeTab() {
   useEffect(() => {
     rpcClient.nodeGetConfig().then((c) => {
       setConfig(c);
-      setIsSeedNode(c.is_seed_node);
       setStorageMb(c.storage_limit_mb);
       setBandwidthKbps(c.bandwidth_limit_kbps);
       setSeedNodes([...c.seed_nodes]);
@@ -443,7 +441,7 @@ function NodeTab() {
   async function save() {
     setSaving(true);
     try {
-      await rpcClient.nodeSetConfig({ is_seed_node: isSeedNode, storage_limit_mb: storageMb, bandwidth_limit_kbps: bandwidthKbps, seed_nodes: seedNodes });
+      await rpcClient.nodeSetConfig({ storage_limit_mb: storageMb, bandwidth_limit_kbps: bandwidthKbps, seed_nodes: seedNodes });
       setSaveMsg("Saved!"); setTimeout(() => setSaveMsg(""), 2000);
     } catch {
       setSaveMsg("Failed to save");
@@ -498,10 +496,6 @@ function NodeTab() {
       {config && (
         <>
           <SectionHeader>Node Settings</SectionHeader>
-
-          <SettingRow label="Seed Node Mode" description="Advertise this node as a seed for others to bootstrap from">
-            <Toggle checked={isSeedNode} onChange={setIsSeedNode} />
-          </SettingRow>
 
           <div style={{ padding: "12px 0", borderBottom: "1px solid var(--color-bc-surface-3)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
@@ -712,8 +706,7 @@ function AdvancedTab() {
   const [newAddr, setNewAddr] = useState("");
   const [logLevel, setLogLevel] = useState("info");
   const [maxConns, setMaxConns] = useState(50);
-  const [mdnsEnabled, setMdnsEnabled] = useState(false);
-  const [serverEnabled, setServerEnabled] = useState(true);
+  const [nodeMode, setNodeMode] = useState<import("../lib/rpc-types").NodeMode>("peer");
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
 
@@ -723,15 +716,14 @@ function AdvancedTab() {
       setListenAddrs([...c.listen_addrs]);
       setLogLevel(c.log_level);
       setMaxConns(c.max_connections);
-      setMdnsEnabled(c.mdns_enabled);
-      setServerEnabled(c.server_enabled);
+      setNodeMode(c.node_mode);
     });
   }, []);
 
   async function save() {
     setSaving(true);
     try {
-      await rpcClient.nodeSetConfig({ listen_addrs: listenAddrs, log_level: logLevel, max_connections: maxConns, mdns_enabled: mdnsEnabled, server_enabled: serverEnabled });
+      await rpcClient.nodeSetConfig({ listen_addrs: listenAddrs, log_level: logLevel, max_connections: maxConns, node_mode: nodeMode });
       setSaveMsg("Saved!"); setTimeout(() => setSaveMsg(""), 2000);
     } catch {
       setSaveMsg("Failed to save");
@@ -766,7 +758,7 @@ function AdvancedTab() {
       <SectionHeader>Network</SectionHeader>
 
       <SettingRow label="Embedded Server" description="Run a local QUIC server to accept incoming peer connections. Disable to act as a client only (requires a seed node; reduces resource usage and security surface). Takes effect on next launch.">
-        <Toggle checked={serverEnabled} onChange={setServerEnabled} />
+        <Toggle checked={nodeMode === "peer"} onChange={(checked) => setNodeMode(checked ? "peer" : "gossip_client")} />
       </SettingRow>
 
       <SettingRow label="Max Connections" description="Maximum simultaneous peer connections">
@@ -776,10 +768,6 @@ function AdvancedTab() {
           style={{ width: 72, background: "var(--color-bc-surface-2)", color: "var(--color-bc-text)", border: "1px solid var(--color-bc-surface-3)", borderRadius: 4, padding: "4px 8px", fontSize: 14 }}
           aria-label="Max connections"
         />
-      </SettingRow>
-
-      <SettingRow label="mDNS Discovery" description="Discover peers on local network (LAN only)">
-        <Toggle checked={mdnsEnabled} onChange={setMdnsEnabled} />
       </SettingRow>
 
       {config && (
@@ -840,7 +828,7 @@ function AboutTab() {
   const identity = useIdentityStore((s) => s.identity);
   const { copied, copy } = useCopyText();
   const BUILD_COMMIT = import.meta.env.VITE_BUILD_COMMIT ?? "development";
-  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.1.0";
+  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.2.0";
 
   return (
     <div>

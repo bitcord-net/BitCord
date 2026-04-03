@@ -8,6 +8,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bitcord_core::{
     crypto::{certificate::HostingCert, channel_keys::ChannelKey, dm::DmEnvelope},
+    dht::{DhtConfig, DhtHandle},
     identity::{NodeIdentity, SigningKey},
     network::{
         NetworkCommand, NodeAddr,
@@ -15,7 +16,7 @@ use bitcord_core::{
         protocol::{ClientRequest, NodePush, NodeResponse, decode_payload, encode_frame},
         tls::NodeTlsCert,
     },
-    node::{dht::Dht, server::NodeServer, store::NodeStore},
+    node::{server::NodeServer, store::NodeStore},
     resource::connection_limiter::ConnectionLimiter,
 };
 use ed25519_dalek::Signature;
@@ -38,11 +39,22 @@ impl TestServer {
         let tls_cert = NodeTlsCert::generate(&sk).expect("generate TLS cert");
 
         let db_path = tmp.path().join("node.redb");
-        let store = Arc::new(NodeStore::open(&db_path).expect("open node store"));
-        let dht = Arc::new(Dht::new(node_identity.verifying_key().to_bytes(), None));
+        let store = Arc::new(NodeStore::open(&db_path, None).expect("open node store"));
         let limiter = Arc::new(ConnectionLimiter::new(50));
 
         let node_pk = node_identity.verifying_key().to_bytes();
+        let dht = Arc::new(
+            DhtHandle::new(DhtConfig {
+                node_pk,
+                self_addr: None,
+                store_path: tmp.path().join("dht.redb"),
+                identity: Arc::new(NodeIdentity::from_signing_key_bytes(
+                    &node_identity.signing_key_bytes(),
+                )),
+            })
+            .await
+            .expect("create test DHT"),
+        );
         let (swarm_cmd_tx, _swarm_cmd_rx) = tokio::sync::mpsc::channel::<NetworkCommand>(1);
         let server = Arc::new(
             NodeServer::bind(
@@ -50,7 +62,7 @@ impl TestServer {
                 &tls_cert,
                 bitcord_core::node::NodeServicesConfig {
                     store: Arc::clone(&store),
-                    dht,
+                    dht: Some(dht),
                     limiter,
                     node_pk,
                     swarm_cmd_tx,
@@ -503,6 +515,156 @@ async fn push_new_message_delivered_to_subscriber() {
         }
         other => panic!("unexpected push: {other:?}"),
     }
+
+    srv.server.close();
+}
+
+// ── Test 10: StoreCommunityPeer requires no auth and gets CommunityPeerAck ────
+
+#[tokio::test]
+async fn store_community_peer_no_auth_required() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let community_pk = [0xCCu8; 32];
+    let node_pk = [0xDDu8; 32];
+
+    // No join_community call — StoreCommunityPeer is a public DHT operation.
+    client
+        .store_community_peer(community_pk, node_pk, srv.node_addr())
+        .await
+        .expect("store_community_peer should succeed without authentication");
+
+    srv.server.close();
+}
+
+// ── Test 11: StoreCommunityPeer + FindCommunityPeers roundtrip ────────────────
+
+#[tokio::test]
+async fn store_and_find_community_peers_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let community_pk = [0x11u8; 32];
+    let node_pk_a = [0x22u8; 32];
+    let node_pk_b = [0x33u8; 32];
+    let addr_a = NodeAddr::new("127.0.0.1".parse().unwrap(), 9901);
+    let addr_b = NodeAddr::new("127.0.0.1".parse().unwrap(), 9902);
+
+    client
+        .store_community_peer(community_pk, node_pk_a, addr_a.clone())
+        .await
+        .expect("store peer A");
+    client
+        .store_community_peer(community_pk, node_pk_b, addr_b.clone())
+        .await
+        .expect("store peer B");
+
+    let records = client
+        .find_community_peers(community_pk)
+        .await
+        .expect("find_community_peers");
+
+    assert_eq!(records.len(), 2, "expected exactly 2 records");
+
+    let ports: Vec<u16> = records.iter().map(|r| r.addr.port).collect();
+    assert!(ports.contains(&9901), "addr_a not found");
+    assert!(ports.contains(&9902), "addr_b not found");
+
+    srv.server.close();
+}
+
+// ── Test 12: FindCommunityPeers on unknown community returns empty ─────────────
+
+#[tokio::test]
+async fn find_community_peers_unknown_community_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let records = client
+        .find_community_peers([0xFFu8; 32])
+        .await
+        .expect("find_community_peers");
+
+    assert!(
+        records.is_empty(),
+        "unknown community should return no records"
+    );
+
+    srv.server.close();
+}
+
+// ── Test 13: StoreCommunityPeer upsert — re-storing same node_pk updates addr ─
+
+#[tokio::test]
+async fn store_community_peer_upsert_updates_addr() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let community_pk = [0x44u8; 32];
+    let node_pk = [0x55u8; 32];
+    let addr_old = NodeAddr::new("127.0.0.1".parse().unwrap(), 9910);
+    let addr_new = NodeAddr::new("127.0.0.1".parse().unwrap(), 9911);
+
+    client
+        .store_community_peer(community_pk, node_pk, addr_old)
+        .await
+        .expect("first store");
+    client
+        .store_community_peer(community_pk, node_pk, addr_new)
+        .await
+        .expect("second store (upsert)");
+
+    let records = client
+        .find_community_peers(community_pk)
+        .await
+        .expect("find_community_peers");
+
+    assert_eq!(records.len(), 1, "upsert should not create a duplicate");
+    assert_eq!(
+        records[0].addr.port, 9911,
+        "addr should be updated to newest"
+    );
+
+    srv.server.close();
+}
+
+// ── Test 14: Records from different communities are isolated ──────────────────
+
+#[tokio::test]
+async fn community_peer_records_are_isolated_by_community() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let cpk_a = [0xAAu8; 32];
+    let cpk_b = [0xBBu8; 32];
+    let node_pk = [0xCCu8; 32];
+
+    client
+        .store_community_peer(
+            cpk_a,
+            node_pk,
+            NodeAddr::new("127.0.0.1".parse().unwrap(), 9920),
+        )
+        .await
+        .expect("store in community A");
+
+    let records_b = client
+        .find_community_peers(cpk_b)
+        .await
+        .expect("find_community_peers B");
+    assert!(records_b.is_empty(), "community B should be empty");
+
+    let records_a = client
+        .find_community_peers(cpk_a)
+        .await
+        .expect("find_community_peers A");
+    assert_eq!(records_a.len(), 1);
 
     srv.server.close();
 }

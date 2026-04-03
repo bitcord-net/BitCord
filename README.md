@@ -11,7 +11,8 @@ BitCord is an encrypted, peer-to-peer communication platform designed as a priva
 *   **Headless Node:** A standalone server binary for running always-on nodes on VPS or home hardware to host communities and mailboxes.
 *   **End-to-End Encryption:** All channel messages and Direct Messages are encrypted using XChaCha20-Poly1305. Identity is managed via Ed25519 keypairs.
 *   **Direct Messages (DMs):** Supports store-and-forward delivery via node mailboxes, allowing users to receive messages sent while they were offline.
-*   **Communities:** Users can create decentralized communities with per-channel encrypted logs. Communities can be hosted locally or migrated to dedicated seed nodes.
+*   **Communities:** Users can create decentralized communities with per-channel encrypted logs. Communities operate in one of two modes: **seeded** (always-on seed node, persistent history) or **seedless** (fully peer-to-peer, ephemeral/IRC-like, online-only).
+*   **DHT Community Peer Discovery:** Both seeded and seedless communities use a Kademlia DHT to discover and connect to peers directly. On join or create, each node announces its presence to the DHT and runs an iterative lookup to find and dial other community members.
 *   **Invite System:** Secure community discovery using Base64URL-encoded invite links that bundle community metadata, connection information, and TLS certificate fingerprints for certificate pinning.
 *   **Roles and Permissions:** Community members can be assigned roles (Admin or Moderator) that grant moderation privileges. See the [Roles and Permissions](#roles-and-permissions) section for details.
 
@@ -119,6 +120,34 @@ BitCord utilizes a decentralized architecture where every participant contribute
 *   **Iterative Data Sync:** Community manifests and message history are fetched directly from peers or dedicated seed nodes. Nodes synchronize encrypted event logs to stay up to date with the latest state.
 *   **Decentralized Identity:** Users own their identity via Ed25519 keypairs. There is no central identity provider; authentication and encryption are performed peer-to-peer using these cryptographic keys.
 *   **Mailbox Routing (DHT):** A Kademlia-style Distributed Hash Table (DHT) is used to route Direct Messages. It maps user IDs to the nodes currently hosting their offline mailboxes, enabling reliable asynchronous delivery even when users are not concurrently online.
+*   **Community Peer Discovery (DHT):** A second DHT record type maps community public keys to lists of known member `(node_pk, addr)` pairs. Both seeded and seedless communities use this for direct P2P connections, reducing reliance on the seed as a single relay point.
+*   **Global Bootstrap Node:** `bitcord.net:9042` is the hard-coded public bootstrap node. It seeds the DHT routing table for nodes that have no other known peers. DHT and bootstrap connections use TOFU TLS; only community seed connections are certificate-pinned.
+
+## Community Modes
+
+Every BitCord community operates in one of two modes, determined at creation time by whether a seed node is configured.
+
+### Seeded Communities
+
+A seeded community has one or more always-on seed nodes that act as message hubs.
+
+| Property | Behavior |
+|---|---|
+| **Message history** | Persistent — the seed stores all encrypted channel logs; members who come online later can fetch history. |
+| **Reachability** | Tracks connectivity to the seed in real time; the `reachable` flag on `CommunityInfo` reflects this. |
+| **Topology** | Hub-and-spoke through the seed, supplemented by direct P2P connections discovered via DHT. |
+
+### Seedless Communities
+
+A seedless community has no seed node. All communication is fully peer-to-peer.
+
+| Property | Behavior |
+|---|---|
+| **Message history** | Ephemeral — messages exist only in the memory of currently connected peers; no central node stores history. |
+| **Reachability** | Always `true`; the community is considered reachable as soon as it is created. |
+| **Topology** | Fully peer-to-peer via DHT discovery; no central hub. IRC-like: suitable for low-latency presence-based communication. |
+
+Both modes use the DHT to discover and dial community peers directly. The `seeded` field on `CommunityInfo` (JSON-RPC) indicates which mode a community uses.
 
 ## How to Use
 
@@ -127,8 +156,16 @@ The desktop app provides all features, including the ability to join communities
 
 ### Headless Mode
 For users who want to provide infrastructure for the network or host permanent communities, the headless node can be run on a server.
+
 ```bash
-cargo run -p bitcord-node -- [FLAGS]
+# Full peer (default) — QUIC server + DHT + mDNS + user identity
+cargo run -p bitcord-node -- --mode peer
+
+# Headless seed — hosts communities and mailboxes, no user identity
+cargo run -p bitcord-node -- --mode headless-seed
+
+# Gossip client — no QUIC server, no DHT; connects outward to seed nodes only
+cargo run -p bitcord-node -- --mode gossip-client
 ```
 
 ### Configuration & Flags
@@ -137,6 +174,7 @@ BitCord can be configured via command-line flags or environment variables:
 *   `BITCORD_PASSPHRASE`: Used to decrypt your identity and local data files. If not set, you will be prompted interactively.
 *   `BITCORD_JOIN_PASSWORD`: Sets a password requirement for new communities to register on a specific node.
 *   `--join-password`: CLI equivalent to the environment variable.
+*   `--mode <peer|headless-seed|gossip-client>`: Node operating mode. Defaults to `peer`.
 
 ### Invite Links
 Communities are shared via a Base64URL-encoded URI format:

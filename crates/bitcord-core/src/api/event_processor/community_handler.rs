@@ -20,6 +20,78 @@ use crate::{
     network::NetworkCommand,
 };
 
+/// Handle a notification that this node has joined a community (e.g. via an
+/// inbound JoinCommunity request or a PushManifest from the admin).
+///
+/// Ensures the node is subscribed to the community's GossipSub topic so it
+/// can relay messages and receive updates.
+pub(super) async fn handle_community_joined(
+    state: &AppState,
+    community_pk: [u8; 32],
+    community_id: String,
+) {
+    let topic = format!("/bitcord/community/{community_id}/1.0.0");
+    info!(%community_id, "subscribing to community topic after join notification");
+    let _ = state
+        .swarm_cmd_tx
+        .send(NetworkCommand::Subscribe(topic))
+        .await;
+
+    // If we have the manifest in NodeStore, load it into state.communities.
+    if let Some(store) = &state.node_store {
+        if let Ok(Some(meta)) = store.get_community_meta(&community_pk) {
+            let mut comms = state.communities.write().await;
+            if !comms.contains_key(&community_id) {
+                match meta.manifest {
+                    Some(manifest) => {
+                        // Real manifest available — load and persist to local cache.
+                        comms.insert(community_id.clone(), manifest);
+                        save_table(
+                            &state.data_dir.join("communities.json"),
+                            &*comms,
+                            state.encryption_key.as_ref(),
+                        );
+                    }
+                    None => {
+                        use crate::model::community::{CommunityManifest, SignedManifest};
+                        use crate::model::types::CommunityId;
+
+                        // No manifest yet. Insert an in-memory placeholder so that
+                        // PeerConnected can queue a FetchManifest using its public key.
+                        // Do NOT persist this to disk — the zeroed signature would be
+                        // invalid, and the real manifest will overwrite this entry
+                        // when it arrives via gossip.
+                        comms.insert(
+                            community_id.clone(),
+                            SignedManifest {
+                                manifest: CommunityManifest {
+                                    id: ulid::Ulid::from_string(&community_id)
+                                        .map(CommunityId)
+                                        .unwrap_or_else(|_| CommunityId::new()),
+                                    name: "Syncing...".to_string(),
+                                    description: String::new(),
+                                    public_key: community_pk,
+                                    created_at: chrono::Utc::now(),
+                                    admin_ids: vec![],
+                                    channel_ids: vec![],
+                                    seed_nodes: vec![],
+                                    version: 0,
+                                    deleted: false,
+                                },
+                                signature: vec![0u8; 64],
+                            },
+                        );
+                        let mut pending = state.pending_manifest_syncs.lock().await;
+                        if !pending.contains(&community_id) {
+                            pending.push(community_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decode a GossipSub message received on a community topic and dispatch it.
 pub(super) async fn handle_community_message(
     state: &AppState,
@@ -104,9 +176,17 @@ pub(super) async fn handle_community_message(
                                 );
                             }
                             // Key arrived via gossip — trigger history catch-up now.
+                            // Prefer the admin peer; fall back to any community peer.
                             let peer_id = {
-                                let peers = state.connected_peers.read().await;
-                                peers.first().map(|p| p.peer_id.clone())
+                                let peers_map = state.connected_peers.read().await;
+                                let list = peers_map
+                                    .get(&community_id_str)
+                                    .map(|v| v.as_slice())
+                                    .unwrap_or(&[]);
+                                list.iter()
+                                    .find(|p| p.is_admin)
+                                    .or_else(|| list.first())
+                                    .map(|p| p.peer_id.clone())
                             };
                             if let Some(peer_id) = peer_id {
                                 let since_seq = if let Some(ref store) = state.node_store {

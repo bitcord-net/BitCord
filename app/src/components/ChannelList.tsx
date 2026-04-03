@@ -118,7 +118,17 @@ export function ChannelList({ communityId }: Props) {
     reordered.splice(toIndex, 0, moved);
     // Rebuild full list preserving other kinds' order
     const newOrder = KIND_ORDER.flatMap((k) => (k === targetKind ? reordered : grouped[k]));
-    reorderChannels(communityId, newOrder.map((ch) => ch.id));
+    const orderedIds = newOrder.map((ch) => ch.id);
+    // Optimistic local update
+    reorderChannels(communityId, orderedIds);
+    // Persist to backend so all members see the new order
+    rpcClient.channelReorder({ community_id: communityId, channel_ids: orderedIds }).catch(() => {
+      toast("Failed to save channel order.", "error");
+      // Revert local state by reloading from backend
+      void rpcClient.channelList(communityId).then((fresh) => {
+        reorderChannels(communityId, fresh.map((ch) => ch.id));
+      }).catch(() => {});
+    });
     dragRef.current = null;
     setDragOver(null);
   };

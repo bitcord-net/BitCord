@@ -95,6 +95,12 @@ export interface RotateKeyParams {
   channel_id: string;
 }
 
+export interface ReorderChannelsParams {
+  community_id: string;
+  /** Full ordered list of channel IDs. */
+  channel_ids: string[];
+}
+
 // ── Messages ──────────────────────────────────────────────────────────────────
 
 export interface ReactionInfo {
@@ -229,17 +235,17 @@ export interface NodeLocalInfo {
   listen_addrs: string[];
 }
 
+export type NodeMode = "gossip_client" | "peer" | "headless_seed";
+
 export interface NodeConfigDto {
   listen_addrs: string[];
   seed_nodes: string[];
   max_connections: number;
   storage_limit_mb: number;
   bandwidth_limit_kbps: number | null;
-  is_seed_node: boolean;
   seed_priority: number;
-  mdns_enabled: boolean;
   log_level: string;
-  server_enabled: boolean;
+  node_mode: NodeMode;
   preferred_mailbox_node: string | null;
 }
 
@@ -249,11 +255,9 @@ export interface SetConfigParams {
   max_connections?: number;
   storage_limit_mb?: number;
   bandwidth_limit_kbps?: number | null;
-  is_seed_node?: boolean;
   seed_priority?: number;
-  mdns_enabled?: boolean;
   log_level?: string;
-  server_enabled?: boolean;
+  node_mode?: NodeMode;
   /** `null` clears the preference; a string sets it. */
   preferred_mailbox_node?: string | null;
 }

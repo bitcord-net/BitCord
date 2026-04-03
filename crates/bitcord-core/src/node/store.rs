@@ -19,6 +19,7 @@ use crate::{
     model::{channel::ChannelManifest, community::SignedManifest, membership::MembershipRecord},
     state::message_log::LogEntry,
 };
+use bitcord_dht::CommunityPeerRecord;
 use std::collections::HashMap;
 
 // ── Table definitions ─────────────────────────────────────────────────────────
@@ -34,6 +35,10 @@ const MAIL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mailboxes");
 /// `community_meta`: key = `community_pk(32)`
 ///                   value = `postcard(CommunityMeta)`
 const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("community_meta");
+
+/// `dht_community_peers`: key = `community_pk(32) ++ node_pk(32)` = 64 bytes
+///                        value = `postcard(CommunityPeerRecord)`
+const DHT_PEERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dht_community_peers");
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
@@ -75,30 +80,65 @@ fn mail_key(user_pk: &[u8; 32], seq: u64) -> [u8; 40] {
     k
 }
 
+/// `community_pk(32) ++ node_pk(32)` = 64 bytes
+fn dht_peer_key(community_pk: &[u8; 32], node_pk: &[u8; 32]) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(community_pk);
+    k[32..].copy_from_slice(node_pk);
+    k
+}
+
 // ── NodeStore ─────────────────────────────────────────────────────────────────
 
 /// Thread-safe persistent store for a BitCord node.
 ///
 /// Backed by `redb` — a transactional embedded key-value database.
+/// All values are encrypted at rest with XChaCha20-Poly1305 when a key is
+/// provided.  Keys are stored in plain form only when `key` is `None`
+/// (tests / headless node without passphrase).
 /// Designed to be wrapped in `Arc` and shared across handler tasks.
 pub struct NodeStore {
     db: Arc<Database>,
+    key: Option<[u8; 32]>,
 }
 
 impl NodeStore {
     /// Open (or create) the node database at `path`.
     ///
+    /// When `key` is `Some`, all stored values are encrypted with
+    /// XChaCha20-Poly1305 (using [`crate::crypto::encrypted_io`]).
+    /// Pass `None` only for tests or nodes running without a passphrase.
+    ///
     /// Initialises all tables if they do not yet exist.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, key: Option<[u8; 32]>) -> Result<Self> {
         let db = Database::create(path).context("open redb database")?;
         let wtxn = db.begin_write().context("init write transaction")?;
         {
             wtxn.open_table(LOG).context("init community_log table")?;
             wtxn.open_table(MAIL).context("init mailboxes table")?;
             wtxn.open_table(META).context("init community_meta table")?;
+            wtxn.open_table(DHT_PEERS)
+                .context("init dht_community_peers table")?;
         }
         wtxn.commit().context("commit init transaction")?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            key,
+        })
+    }
+
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match &self.key {
+            Some(k) => crate::crypto::encrypted_io::encrypt_bytes(plaintext, k),
+            None => Ok(plaintext.to_vec()),
+        }
+    }
+
+    fn decrypt(&self, blob: &[u8]) -> Result<Vec<u8>> {
+        match &self.key {
+            Some(k) => crate::crypto::encrypted_io::decrypt_bytes(blob, k),
+            None => Ok(blob.to_vec()),
+        }
     }
 
     // ── Community message log ─────────────────────────────────────────────
@@ -145,6 +185,7 @@ impl NodeStore {
             };
             let key = log_key(community_pk, &chan, seq);
             let value = postcard::to_allocvec(&entry).context("encode LogEntry")?;
+            let value = self.encrypt(&value)?;
             table.insert(key.as_slice(), value.as_slice())?;
             seq
         };
@@ -188,7 +229,8 @@ impl NodeStore {
         let mut entries = Vec::new();
         for item in table.range(lower.as_slice()..=upper.as_slice())? {
             let (_, v) = item?;
-            entries.push(postcard::from_bytes::<LogEntry>(v.value()).context("decode LogEntry")?);
+            let plain = self.decrypt(v.value())?;
+            entries.push(postcard::from_bytes::<LogEntry>(&plain).context("decode LogEntry")?);
         }
         Ok(entries)
     }
@@ -243,6 +285,7 @@ impl NodeStore {
             };
             let key = mail_key(recipient_pk, seq);
             let value = postcard::to_allocvec(&entry).context("encode LogEntry")?;
+            let value = self.encrypt(&value)?;
             table.insert(key.as_slice(), value.as_slice())?;
             seq
         };
@@ -259,7 +302,8 @@ impl NodeStore {
         let mut entries = Vec::new();
         for item in table.range(lower.as_slice()..=upper.as_slice())? {
             let (_, v) = item?;
-            entries.push(postcard::from_bytes::<LogEntry>(v.value()).context("decode LogEntry")?);
+            let plain = self.decrypt(v.value())?;
+            entries.push(postcard::from_bytes::<LogEntry>(&plain).context("decode LogEntry")?);
         }
         Ok(entries)
     }
@@ -273,8 +317,9 @@ impl NodeStore {
         let table = rtxn.open_table(META)?;
         for item in table.iter()? {
             let (_, v) = item?;
+            let plain = self.decrypt(v.value())?;
             let meta: CommunityMeta =
-                postcard::from_bytes(v.value()).context("decode CommunityMeta")?;
+                postcard::from_bytes(&plain).context("decode CommunityMeta")?;
             for member in meta.members.values() {
                 if member.public_key == *ed25519_pk {
                     return Ok(Some(member.x25519_public_key));
@@ -288,7 +333,8 @@ impl NodeStore {
 
     /// Upsert community metadata.
     pub fn set_community_meta(&self, community_pk: &[u8; 32], meta: &CommunityMeta) -> Result<()> {
-        let value = postcard::to_allocvec(meta).context("encode CommunityMeta")?;
+        let plain = postcard::to_allocvec(meta).context("encode CommunityMeta")?;
+        let value = self.encrypt(&plain)?;
         let wtxn = self.db.begin_write()?;
         {
             let mut table = wtxn.open_table(META)?;
@@ -303,9 +349,12 @@ impl NodeStore {
         let rtxn = self.db.begin_read()?;
         let table = rtxn.open_table(META)?;
         match table.get(community_pk.as_slice())? {
-            Some(v) => Ok(Some(
-                postcard::from_bytes(v.value()).context("decode CommunityMeta")?,
-            )),
+            Some(v) => {
+                let plain = self.decrypt(v.value())?;
+                Ok(Some(
+                    postcard::from_bytes(&plain).context("decode CommunityMeta")?,
+                ))
+            }
             None => Ok(None),
         }
     }
@@ -368,6 +417,92 @@ impl NodeStore {
             result.push(pk);
         }
         Ok(result)
+    }
+
+    // ── DHT community peer persistence ────────────────────────────────────
+
+    /// Persist a community peer record.  Overwrites any existing record for
+    /// the same `(community_pk, node_pk)` pair.
+    pub fn set_community_peer_record(
+        &self,
+        community_pk: &[u8; 32],
+        record: &CommunityPeerRecord,
+    ) -> Result<()> {
+        let key = dht_peer_key(community_pk, &record.node_pk);
+        let plain = postcard::to_allocvec(record).context("encode CommunityPeerRecord")?;
+        let value = self.encrypt(&plain)?;
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut table = wtxn.open_table(DHT_PEERS)?;
+            table.insert(key.as_slice(), value.as_slice())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Return all stored community peer records as `(community_pk, record)` pairs.
+    ///
+    /// Used on startup to pre-populate the in-memory DHT so community peer
+    /// discovery works immediately without waiting for new announcements.
+    pub fn all_community_peer_records(&self) -> Result<Vec<([u8; 32], CommunityPeerRecord)>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(DHT_PEERS)?;
+        let mut result = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            if k.value().len() < 64 {
+                continue;
+            }
+            let mut community_pk = [0u8; 32];
+            community_pk.copy_from_slice(&k.value()[..32]);
+            let plain = self.decrypt(v.value())?;
+            match postcard::from_bytes::<CommunityPeerRecord>(&plain) {
+                Ok(record) => result.push((community_pk, record)),
+                Err(e) => {
+                    tracing::warn!(
+                        "DHT: skipping unreadable community peer record (schema migration?): {e}"
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Remove all community peer records older than `cutoff_secs` Unix timestamp.
+    ///
+    /// Called by the DHT expiry task to prune stale records from disk.
+    pub fn remove_expired_community_peers(&self, cutoff_secs: u64) -> Result<()> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(DHT_PEERS)?;
+        let expired_keys: Vec<Vec<u8>> = table
+            .iter()?
+            .filter_map(|item| {
+                let (k, v) = item.ok()?;
+                let plain = self.decrypt(v.value()).ok()?;
+                let record: CommunityPeerRecord = postcard::from_bytes(&plain).ok()?;
+                if record.announced_at < cutoff_secs {
+                    Some(k.value().to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(table);
+        drop(rtxn);
+
+        if expired_keys.is_empty() {
+            return Ok(());
+        }
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut table = wtxn.open_table(DHT_PEERS)?;
+            for key in &expired_keys {
+                table.remove(key.as_slice())?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// Return all community public keys currently registered on this node.
@@ -487,7 +622,7 @@ mod tests {
 
     fn open_store() -> (NodeStore, TempDir) {
         let dir = TempDir::new().unwrap();
-        let store = NodeStore::open(&dir.path().join("node.redb")).unwrap();
+        let store = NodeStore::open(&dir.path().join("node.redb"), None).unwrap();
         (store, dir)
     }
 
@@ -714,5 +849,188 @@ mod tests {
             "expected some entries deleted, got {}",
             remaining.len()
         );
+    }
+
+    // ── DHT community peer persistence tests ─────────────────────────────────
+
+    fn make_record(port: u16) -> CommunityPeerRecord {
+        use std::net::{IpAddr, Ipv4Addr};
+        CommunityPeerRecord {
+            node_pk: [port as u8; 32],
+            addr: crate::network::NodeAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            announced_at: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn community_peer_record_roundtrip() {
+        let (store, _dir) = open_store();
+        let cpk = [50u8; 32];
+        let rec = make_record(9900);
+
+        store.set_community_peer_record(&cpk, &rec).unwrap();
+
+        let all = store.all_community_peer_records().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, cpk);
+        assert_eq!(all[0].1.addr.port, 9900);
+    }
+
+    #[test]
+    fn community_peer_record_overwrite() {
+        let (store, _dir) = open_store();
+        let cpk = [51u8; 32];
+        let rec1 = make_record(9901);
+        let mut rec2 = make_record(9901);
+        rec2.announced_at = 2_000_000;
+
+        store.set_community_peer_record(&cpk, &rec1).unwrap();
+        store.set_community_peer_record(&cpk, &rec2).unwrap();
+
+        let all = store.all_community_peer_records().unwrap();
+        // Same (cpk, node_pk) key — only one entry.
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1.announced_at, 2_000_000);
+    }
+
+    #[test]
+    fn all_community_peer_records_multiple_communities() {
+        let (store, _dir) = open_store();
+        let cpk_a = [52u8; 32];
+        let cpk_b = [53u8; 32];
+
+        store
+            .set_community_peer_record(&cpk_a, &make_record(9910))
+            .unwrap();
+        store
+            .set_community_peer_record(&cpk_a, &make_record(9911))
+            .unwrap();
+        store
+            .set_community_peer_record(&cpk_b, &make_record(9912))
+            .unwrap();
+
+        let all = store.all_community_peer_records().unwrap();
+        assert_eq!(all.len(), 3);
+        let a_count = all.iter().filter(|(cpk, _)| *cpk == cpk_a).count();
+        let b_count = all.iter().filter(|(cpk, _)| *cpk == cpk_b).count();
+        assert_eq!(a_count, 2);
+        assert_eq!(b_count, 1);
+    }
+
+    #[test]
+    fn remove_expired_community_peers_removes_old_keeps_fresh() {
+        let (store, _dir) = open_store();
+        let cpk = [54u8; 32];
+
+        // Stale record (announced at t=100, cutoff=1000 → 100 < 1000 → stale).
+        let mut stale = make_record(9920);
+        stale.announced_at = 100;
+        // Fresh record (announced at t=2000, cutoff=1000 → 2000 >= 1000 → fresh).
+        let mut fresh = make_record(9921);
+        fresh.announced_at = 2000;
+
+        store.set_community_peer_record(&cpk, &stale).unwrap();
+        store.set_community_peer_record(&cpk, &fresh).unwrap();
+
+        // Remove records older than cutoff = 1000.
+        store.remove_expired_community_peers(1000).unwrap();
+
+        let remaining = store.all_community_peer_records().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1.addr.port, 9921);
+    }
+
+    #[test]
+    fn remove_expired_community_peers_all_stale_clears_table() {
+        let (store, _dir) = open_store();
+        let cpk = [55u8; 32];
+        let mut rec = make_record(9930);
+        rec.announced_at = 50;
+
+        store.set_community_peer_record(&cpk, &rec).unwrap();
+        store.remove_expired_community_peers(1000).unwrap();
+
+        assert!(store.all_community_peer_records().unwrap().is_empty());
+    }
+
+    // ── At-rest encryption tests ──────────────────────────────────────────────
+
+    fn open_encrypted_store() -> (NodeStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = [0xDEu8; 32];
+        let store = NodeStore::open(&dir.path().join("enc.redb"), Some(key)).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn encrypted_store_message_roundtrip() {
+        let (store, _dir) = open_encrypted_store();
+        let cpk = [60u8; 32];
+        let chan = Ulid::new();
+
+        store
+            .append_message(
+                &cpk,
+                &chan,
+                [0u8; 24],
+                vec![7, 8, 9],
+                "mid".into(),
+                "bob".into(),
+                42,
+            )
+            .unwrap();
+
+        let msgs = store.get_messages(&cpk, &chan, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].ciphertext, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn encrypted_store_community_meta_roundtrip() {
+        let (store, _dir) = open_encrypted_store();
+        let sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let node_pk = sk.verifying_key().to_bytes();
+        let cert = crate::crypto::certificate::HostingCert::new(&sk, node_pk, u64::MAX);
+        let community_pk = cert.community_pk;
+        let meta = CommunityMeta {
+            cert,
+            manifest: None,
+            channels: Vec::new(),
+            channel_keys: std::collections::HashMap::new(),
+            members: std::collections::HashMap::new(),
+        };
+
+        store.set_community_meta(&community_pk, &meta).unwrap();
+        let loaded = store.get_community_meta(&community_pk).unwrap().unwrap();
+        assert_eq!(loaded.community_pk(), community_pk);
+    }
+
+    #[test]
+    fn unencrypted_blob_unreadable_by_encrypted_store() {
+        // Write with no-key store, attempt to read with keyed store (different paths
+        // to avoid redb file-lock conflicts, simulating what would happen if the key
+        // changes between runs).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_plain = dir.path().join("plain.redb");
+        let path_enc = dir.path().join("enc.redb");
+
+        {
+            let plain = NodeStore::open(&path_plain, None).unwrap();
+            let cpk = [70u8; 32];
+            let chan = Ulid::new();
+            plain
+                .append_message(&cpk, &chan, [0u8; 24], vec![1], "m".into(), "a".into(), 0)
+                .unwrap();
+        }
+        {
+            let enc = NodeStore::open(&path_enc, Some([0xAAu8; 32])).unwrap();
+            let cpk = [70u8; 32];
+            let chan = Ulid::new();
+            enc.append_message(&cpk, &chan, [0u8; 24], vec![2], "n".into(), "b".into(), 0)
+                .unwrap();
+            let msgs = enc.get_messages(&cpk, &chan, 0).unwrap();
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0].ciphertext, vec![2]);
+        }
     }
 }

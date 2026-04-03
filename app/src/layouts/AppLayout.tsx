@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { Outlet, useNavigate, useParams, useLocation } from "react-router-dom";
-import { MessageSquare, Settings, Plus, Globe, LogOut, Copy, Trash2, ArrowLeft, WifiOff } from "lucide-react";
+import { MessageSquare, Settings, Plus, Globe, LogOut, Copy, Trash2, ArrowLeft, WifiOff, Users, X } from "lucide-react";
 import { useRpc, rpcClient } from "../hooks/useRpc";
 import { useSubscription } from "../hooks/useSubscription";
 import { useOsNotifications, isInDnd } from "../hooks/useOsNotifications";
@@ -547,6 +547,7 @@ function CommunitySidebar() {
     <>
       <nav
         aria-label="Communities"
+        data-tauri-drag-region
         style={{
           width: "72px",
           background: "var(--color-bc-surface-1)",
@@ -889,44 +890,137 @@ function UserPanel() {
   );
 }
 
-// ── Mobile back button ────────────────────────────────────────────────────────
+// ── Mobile channel header ─────────────────────────────────────────────────────
 
-function MobileBackButton() {
-  const navigate = useNavigate();
-  const { cid } = useParams();
-  const location = useLocation();
-  const isDmRoute = location.pathname.startsWith("/app/dm");
-
-  const handleBack = () => {
-    if (isDmRoute) navigate("/app/dm/");
-    else if (cid) navigate(`/app/community/${cid}/channel/`);
-    else navigate(-1 as never);
+function MobileChannelHeader({
+  title,
+  onBack,
+  onMembersClick,
+}: {
+  title: string;
+  onBack: () => void;
+  onMembersClick?: () => void;
+}) {
+  const btnStyle: React.CSSProperties = {
+    width: "40px",
+    height: "48px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "none",
+    border: "none",
+    cursor: "pointer",
+    color: "var(--color-bc-text)",
+    flexShrink: 0,
   };
-
   return (
-    <button
-      onClick={handleBack}
-      aria-label="Back"
+    <div
+      data-tauri-drag-region
       style={{
-        position: "fixed",
-        top: "0.75rem",
-        left: "0.75rem",
-        zIndex: 50,
-        width: "36px",
-        height: "36px",
-        borderRadius: "50%",
-        border: "none",
-        background: "var(--color-bc-surface-1)",
-        color: "var(--color-bc-text)",
-        cursor: "pointer",
         display: "flex",
         alignItems: "center",
-        justifyContent: "center",
-        boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+        height: "48px",
+        background: "var(--color-bc-surface-1)",
+        borderBottom: "1px solid var(--color-bc-surface-3)",
+        flexShrink: 0,
       }}
     >
-      <ArrowLeft size={18} aria-hidden="true" />
-    </button>
+      <button style={btnStyle} onClick={onBack} aria-label="Back">
+        <ArrowLeft size={18} aria-hidden="true" />
+      </button>
+      <span
+        style={{
+          flex: 1,
+          textAlign: "center",
+          fontWeight: 600,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          color: "var(--color-bc-text)",
+          fontSize: "0.9375rem",
+        }}
+      >
+        {title}
+      </span>
+      {onMembersClick ? (
+        <button style={btnStyle} onClick={onMembersClick} aria-label="Members">
+          <Users size={18} aria-hidden="true" />
+        </button>
+      ) : (
+        <div style={{ width: "40px", flexShrink: 0 }} />
+      )}
+    </div>
+  );
+}
+
+// ── Mobile member list drawer ─────────────────────────────────────────────────
+
+function MemberListDrawer({
+  communityId,
+  onClose,
+}: {
+  communityId: string;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{
+          position: "fixed",
+          inset: 0,
+          zIndex: 40,
+          background: "rgba(0,0,0,0.5)",
+        }}
+      />
+      <div
+        style={{
+          position: "fixed",
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: "min(280px, 85vw)",
+          zIndex: 41,
+          background: "var(--color-bc-surface-2)",
+          display: "flex",
+          flexDirection: "column",
+          boxShadow: "-4px 0 16px rgba(0,0,0,0.4)",
+          paddingTop: "var(--sat, env(safe-area-inset-top, 0px))",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "0.75rem 1rem",
+            borderBottom: "1px solid var(--color-bc-surface-3)",
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ fontWeight: 600, color: "var(--color-bc-text)" }}>Members</span>
+          <button
+            onClick={onClose}
+            aria-label="Close members"
+            style={{
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              color: "var(--color-bc-muted)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px",
+            }}
+          >
+            <X size={18} aria-hidden="true" />
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          <MemberList communityId={communityId} />
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -1047,9 +1141,38 @@ export function AppLayout() {
   useTheme();
   const { cid, chid, peerId } = useParams();
   const location = useLocation();
+  const navigate = useNavigate();
   const isDmRoute = location.pathname.startsWith("/app/dm");
   const isMobile = useIsMobile();
   const hasDestination = Boolean(chid || peerId || location.pathname.includes("/settings"));
+
+  const { channels } = useCommunitiesStore();
+  const { conversations } = useDmsStore();
+  const [membersDrawerOpen, setMembersDrawerOpen] = useState(false);
+
+  useEffect(() => {
+    setMembersDrawerOpen(false);
+  }, [chid, peerId]);
+
+  const channelTitle = useMemo(() => {
+    if (location.pathname.includes("/settings")) return "Settings";
+    if (isDmRoute && peerId) {
+      const conv = conversations.find((c) => c.peerId === peerId);
+      return conv?.displayName ?? peerId;
+    }
+    if (cid && chid) {
+      const chs = channels[cid];
+      const ch = chs?.find((c) => c.id === chid);
+      return ch?.name ? `# ${ch.name}` : "";
+    }
+    return "";
+  }, [location.pathname, isDmRoute, peerId, conversations, cid, chid, channels]);
+
+  const handleMobileBack = useCallback(() => {
+    if (isDmRoute) navigate("/app/dm/");
+    else if (cid) navigate(`/app/community/${cid}/channel/`);
+    else navigate(-1 as never);
+  }, [isDmRoute, cid, navigate]);
 
   if (isMobile) {
     return (
@@ -1065,10 +1188,17 @@ export function AppLayout() {
         {hasDestination ? (
           <>
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
+              <MobileChannelHeader
+                title={channelTitle}
+                onBack={handleMobileBack}
+                onMembersClick={cid && !isDmRoute ? () => setMembersDrawerOpen(true) : undefined}
+              />
               {!isDmRoute && <SeedUnreachableBanner />}
               <MainContent />
             </div>
-            <MobileBackButton />
+            {membersDrawerOpen && cid && (
+              <MemberListDrawer communityId={cid} onClose={() => setMembersDrawerOpen(false)} />
+            )}
           </>
         ) : (
           <>

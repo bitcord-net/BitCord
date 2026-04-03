@@ -60,6 +60,14 @@ pub struct CommunityInfo {
     /// to a seed node have `reachable = false`.
     #[serde(default = "default_reachable")]
     pub reachable: bool,
+    /// `true` when this community has at least one configured seed node.
+    ///
+    /// Seeded communities have persistent message history, offline mailbox
+    /// support, and guaranteed delivery via the seed.  Seedless communities
+    /// are ephemeral (IRC-like): messages are only delivered to currently
+    /// online peers and history is not stored on any central node.
+    #[serde(default)]
+    pub seeded: bool,
 }
 
 fn default_reachable() -> bool {
@@ -144,6 +152,13 @@ pub struct DeleteChannelParams {
 pub struct RotateKeyParams {
     pub community_id: String,
     pub channel_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReorderChannelsParams {
+    pub community_id: String,
+    /// Full ordered list of channel IDs for this community.
+    pub channel_ids: Vec<String>,
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -295,6 +310,8 @@ pub struct PeerSummary {
     pub latency_ms: Option<u64>,
     pub relay_capable: bool,
     pub reputation: i32,
+    pub is_admin: bool,
+    pub community_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -304,11 +321,9 @@ pub struct NodeConfigDto {
     pub max_connections: usize,
     pub storage_limit_mb: u64,
     pub bandwidth_limit_kbps: Option<u64>,
-    pub is_seed_node: bool,
+    pub node_mode: crate::config::NodeMode,
     pub seed_priority: u8,
-    pub mdns_enabled: bool,
     pub log_level: String,
-    pub server_enabled: bool,
     pub preferred_mailbox_node: Option<String>,
 }
 
@@ -319,11 +334,9 @@ pub struct SetConfigParams {
     pub max_connections: Option<usize>,
     pub storage_limit_mb: Option<u64>,
     pub bandwidth_limit_kbps: Option<Option<u64>>,
-    pub is_seed_node: Option<bool>,
+    pub node_mode: Option<crate::config::NodeMode>,
     pub seed_priority: Option<u8>,
-    pub mdns_enabled: Option<bool>,
     pub log_level: Option<String>,
-    pub server_enabled: Option<bool>,
     /// `Some(None)` clears the preference; `Some(Some(addr))` sets it.
     pub preferred_mailbox_node: Option<Option<String>>,
 }

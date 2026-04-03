@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -27,10 +28,18 @@ pub(crate) async fn reconnect_seed_loop(
     join_community: Option<([u8; 32], String)>,
     join_community_password: Option<String>,
     cert_fingerprint: [u8; 32],
+    own_addrs: Arc<RwLock<HashSet<String>>>,
 ) {
+    let addr_str = addr.to_string();
     let mut delay_secs: u64 = 5;
     loop {
         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        // If STUN has since identified this address as our own (self-hosted seed),
+        // stop retrying — we cannot hairpin-connect to ourselves via NAT.
+        if own_addrs.read().await.contains(&addr_str) {
+            info!(%addr, "seed reconnect: address is own (self-hosted); stopping loop");
+            return;
+        }
         debug!(%addr, delay_secs, "seed reconnect: attempting");
         match NodeClient::connect(addr.clone(), cert_fingerprint, Arc::clone(&identity)).await {
             Ok((client, node_pk, push_rx)) => {
