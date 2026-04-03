@@ -184,7 +184,8 @@ async fn run_mdns(own_pk_hex: String, quic_port: u16, cmd_tx: mpsc::Sender<Netwo
     // Using Arc<Mutex<HashSet>> so health check task can read it.
     let already_dialed = health_already_dialed;
     // Maps mDNS fullname → pk_hex so we can evict on ServiceRemoved.
-    let mut resolved_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resolved_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     info!("mDNS: browsing for services on {}", SERVICE_TYPE);
 
