@@ -255,8 +255,12 @@ export class BitCordTestClient {
   communityCreate = (p: Record<string, unknown>) =>
     this.call<Record<string, unknown>>("community_create", p);
 
-  communityJoin = (invite: string) =>
-    this.call<Record<string, unknown>>("community_join", { invite });
+  communityJoin = (invite: string) => {
+    const b64 = invite.startsWith("bitcord://join/")
+      ? invite.slice("bitcord://join/".length)
+      : invite;
+    return this.call<Record<string, unknown>>("community_join", { invite: b64 });
+  };
 
   communityList = () =>
     this.call<Record<string, unknown>[]>("community_list");
@@ -279,9 +283,25 @@ export class BitCordTestClient {
   messageGetHistory = (p: Record<string, unknown>) =>
     this.call<Record<string, unknown>[]>("message_get_history", p);
 
+  communityGenerateInvite = (communityId: string) =>
+    this.call<string>("community_generate_invite", [communityId]);
+
   nodeGetLocalAddrs = () =>
     this.call<{ node_address: string; listen_addrs: string[] }>("node_get_local_addrs");
 
   nodeGetMetrics = () =>
     this.call<Record<string, unknown>>("node_get_metrics");
+
+  memberList = (communityId: string) =>
+    this.call<Record<string, unknown>[]>("member_list", [communityId]);
+
+  dmSend = (peerId: string, body: string) =>
+    this.call<Record<string, unknown>>("dm_send", {
+      peer_id: peerId,
+      body,
+      reply_to: null,
+    });
+
+  dmGetHistory = (peerId: string) =>
+    this.call<Record<string, unknown>[]>("dm_get_history", { peer_id: peerId });
 }

@@ -9,7 +9,7 @@ use bitcord_core::{
 };
 use clap::{Parser, ValueEnum};
 use std::{path::PathBuf, sync::Arc};
-use tracing::{info, warn};
+use tracing::info;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -38,10 +38,6 @@ struct Args {
     /// Node operating mode
     #[arg(long, value_enum)]
     mode: Option<CliMode>,
-
-    /// [DEPRECATED] Run as a headless seed node. Use --mode headless-seed instead.
-    #[arg(long, hide = true)]
-    seed: bool,
 
     /// Log level filter (trace, debug, info, warn, error)
     #[arg(long)]
@@ -84,16 +80,13 @@ async fn main() -> Result<()> {
         config.identity_path = dir.join("identity.key");
     }
 
-    // Resolve node mode: --mode takes precedence, then legacy --seed flag.
+    // Resolve node mode: --mode takes precedence.
     if let Some(mode) = args.mode {
         config.node_mode = match mode {
             CliMode::GossipClient => NodeMode::GossipClient,
             CliMode::Peer => NodeMode::Peer,
             CliMode::HeadlessSeed => NodeMode::HeadlessSeed,
         };
-    } else if args.seed {
-        warn!("--seed is deprecated; use --mode headless-seed instead");
-        config.node_mode = NodeMode::HeadlessSeed;
     }
 
     if let Some(level) = args.log_level {

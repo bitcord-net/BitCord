@@ -1,6 +1,6 @@
 [package]
 name = "bitcord-dht"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["BitCord Contributors"]
 description = "Standalone Kademlia DHT data layer for BitCord — routing table, record store, and TTL expiry."

@@ -1,5 +1,3 @@
-pub mod bootstrap;
-
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -35,8 +33,6 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// Multiaddresses to listen on.
     pub listen_addrs: Vec<String>,
-    /// Bootstrap seed node Multiaddresses.
-    pub seed_nodes: Vec<String>,
     /// Maximum number of simultaneous connections.
     pub max_connections: usize,
     /// Maximum disk storage for channel state in megabytes.
@@ -82,7 +78,6 @@ impl Default for NodeConfig {
             identity_path: base.join("identity.key"),
             data_dir: base,
             listen_addrs: vec!["0.0.0.0:7332".to_string(), "[::]:7332".to_string()],
-            seed_nodes: Vec::new(),
             max_connections: 50,
             storage_limit_mb: 512,
             bandwidth_limit_kbps: None,
@@ -139,16 +134,16 @@ impl NodeConfig {
 
     /// Returns the default config file path (platform-dependent).
     ///
-    /// - **Linux:** `~/.local/share/bitcord/config.toml`
-    /// - **macOS:** `~/Library/Application Support/com.bitcord.bitcord/config.toml`
-    /// - **Windows:** `%LOCALAPPDATA%\bitcord\bitcord\data\config.toml`
+    /// - **Linux:** `~/.local/share/net.bitcord.node/config.toml`
+    /// - **macOS:** `~/Library/Application Support/net.bitcord.node/config.toml`
+    /// - **Windows:** `%APPDATA%\net.bitcord.node\config.toml`
     pub fn default_path() -> PathBuf {
         default_data_dir().join("config.toml")
     }
 }
 
 fn default_data_dir() -> PathBuf {
-    ProjectDirs::from("com", "bitcord", "bitcord")
+    ProjectDirs::from("net", "bitcord", "node")
         .map(|d| d.data_local_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".bitcord"))
 }

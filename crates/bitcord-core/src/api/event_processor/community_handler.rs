@@ -31,7 +31,7 @@ pub(super) async fn handle_community_joined(
     community_id: String,
 ) {
     let topic = format!("/bitcord/community/{community_id}/1.0.0");
-    info!(%community_id, "subscribing to community topic after join notification");
+    info!(%community_id, "joined community, subscribing to gossip topic");
     let _ = state
         .swarm_cmd_tx
         .send(NetworkCommand::Subscribe(topic))

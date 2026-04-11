@@ -435,7 +435,7 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitcord-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "bitcord-dht"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "postcard",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "bitcord-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bitcord-core",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "bitcord-tauri"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bitcord-core",

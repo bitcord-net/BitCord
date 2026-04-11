@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -29,11 +29,18 @@ pub(crate) async fn reconnect_seed_loop(
     join_community_password: Option<String>,
     cert_fingerprint: [u8; 32],
     own_addrs: Arc<RwLock<HashSet<String>>>,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) {
     let addr_str = addr.to_string();
     let mut delay_secs: u64 = 5;
     loop {
-        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                info!(%addr, "seed reconnect: cancelled (seed evicted from config)");
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+        }
         // If STUN has since identified this address as our own (self-hosted seed),
         // stop retrying — we cannot hairpin-connect to ourselves via NAT.
         if own_addrs.read().await.contains(&addr_str) {
@@ -69,6 +76,7 @@ pub(crate) async fn reconnect_seed_loop(
                 let _ = reg_tx
                     .send(PeerRegistration {
                         peer_id,
+                        node_pk,
                         client,
                         is_seed: true,
                         addr,
@@ -87,5 +95,84 @@ pub(crate) async fn reconnect_seed_loop(
                 delay_secs = (delay_secs * 2).min(300); // cap at 5 minutes
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Verify that `reconnect_seed_loop` exits promptly when the cancel signal
+    /// is sent, without waiting for the back-off sleep to expire.
+    #[tokio::test]
+    async fn reconnect_loop_exits_on_cancel() {
+        let addr: NodeAddr = "127.0.0.1:1".parse().expect("parse addr"); // port 1 is unreachable
+        let identity = Arc::new(NodeIdentity::generate());
+        let (reg_tx, _reg_rx) = mpsc::channel(4);
+        let (evt_tx, _evt_rx) = mpsc::channel(4);
+        let own_addrs = Arc::new(RwLock::new(HashSet::new()));
+
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+        // Send the cancel signal immediately — before the loop even starts its
+        // first sleep — so the select picks it up on the very first iteration.
+        cancel_tx.send(()).expect("send cancel");
+
+        // The loop should return almost instantly.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reconnect_seed_loop(
+                addr,
+                identity,
+                reg_tx,
+                evt_tx,
+                String::new(),
+                None,
+                None,
+                [0u8; 32],
+                own_addrs,
+                cancel_rx,
+            ),
+        )
+        .await
+        .expect("reconnect_seed_loop should have exited quickly after cancel");
+    }
+
+    /// Verify that the loop does NOT exit before the cancel signal is sent
+    /// (i.e., the cancellation is not spurious).
+    #[tokio::test]
+    async fn reconnect_loop_does_not_exit_without_cancel() {
+        let addr: NodeAddr = "127.0.0.1:1".parse().expect("parse addr");
+        let identity = Arc::new(NodeIdentity::generate());
+        let (reg_tx, _reg_rx) = mpsc::channel(4);
+        let (evt_tx, _evt_rx) = mpsc::channel(4);
+        let own_addrs = Arc::new(RwLock::new(HashSet::new()));
+
+        let (_cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        // _cancel_tx is intentionally NOT sent on, so the loop stays alive.
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reconnect_seed_loop(
+                addr,
+                identity,
+                reg_tx,
+                evt_tx,
+                String::new(),
+                None,
+                None,
+                [0u8; 32],
+                own_addrs,
+                cancel_rx,
+            ),
+        )
+        .await;
+
+        // Should have timed out (Err) because the loop is still sleeping.
+        assert!(
+            result.is_err(),
+            "loop should still be running without a cancel signal"
+        );
     }
 }

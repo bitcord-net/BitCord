@@ -250,8 +250,17 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
             }
 
             // Update DHT self-address with the bound port.
+            // If the socket bound to the wildcard (0.0.0.0 / ::), fall back to
+            // loopback so that peer-info announcements contain a reachable address
+            // in local / test environments (before NAT/STUN discovers the real IP).
             if let Some(dht) = &dht {
+                use std::net::{IpAddr, Ipv4Addr};
                 let ip = quic_local_addr.ip();
+                let ip = if ip.is_unspecified() {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    ip
+                };
                 dht.update_self_addr(NodeAddr::new(ip, actual_port));
             }
 
@@ -375,6 +384,37 @@ pub async fn init_node(cfg: NodeInitConfig) -> Result<NodeInitResult> {
                 }
             }
         });
+    }
+
+    // ── 14b. Peer info re-announcement (hourly) ───────────────────────────────
+    // Announces this node's x25519_pk and QUIC address to the DHT so that
+    // other peers can send DMs without a prior shared community.
+    // Only for Peer mode (HeadlessSeed has no user identity).
+    if node_mode == NodeMode::Peer {
+        if let Some(dht_peer_info) = dht.clone() {
+            let own_peer_id_bytes = *identity.to_peer_id().as_bytes();
+            let own_x25519_pk = identity.x25519_public_key_bytes();
+            let display_name_src = Arc::clone(&app_state);
+            tokio::spawn(async move {
+                // No first-tick skip — fires immediately on startup so peer info is
+                // DHT-discoverable right away, unlike the community presence loop
+                // (see step 14a) which intentionally delays until the second tick.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    let display_name = display_name_src
+                        .config
+                        .read()
+                        .await
+                        .display_name
+                        .clone()
+                        .unwrap_or_default();
+                    dht_peer_info
+                        .register_peer_info(own_peer_id_bytes, own_x25519_pk, display_name)
+                        .await;
+                }
+            });
+        }
     }
 
     // ── 15. Swarm event processor ──────────────────────────────────────────────

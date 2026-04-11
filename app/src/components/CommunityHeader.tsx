@@ -11,22 +11,6 @@ interface Props {
   community: CommunityInfo;
 }
 
-function buildInviteLink(community: CommunityInfo): string {
-  const payload = JSON.stringify({
-    community_id: community.id,
-    name: community.name,
-    description: community.description,
-    public_key_hex: community.public_key_hex,
-    seed_nodes: community.seed_nodes,
-  });
-  // base64url encode
-  const b64 = btoa(payload)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-  return `bitcord://join/${b64}`;
-}
-
 export function CommunityHeader({ community }: Props) {
   const navigate = useNavigate();
   const { identity } = useIdentityStore();
@@ -70,17 +54,11 @@ export function CommunityHeader({ community }: Props) {
 
   const copyInvite = async () => {
     let link: string;
-    if (isAdmin) {
-      // Admins get a cryptographically signed invite from the backend.
-      try {
-        link = await rpcClient.communityGenerateInvite(community.id);
-      } catch {
-        // Fall back to unsigned invite if the RPC fails unexpectedly.
-        link = buildInviteLink(community);
-      }
-    } else {
-      // Non-admins build an unsigned invite using only the admin-specified seed nodes.
-      link = buildInviteLink(community);
+    try {
+      link = await rpcClient.communityGenerateInvite(community.id);
+    } catch (err) {
+      setActionError(err instanceof RpcError ? err.message : "Failed to generate invite link.");
+      return;
     }
     try {
       await navigator.clipboard.writeText(link);
@@ -154,26 +132,28 @@ export function CommunityHeader({ community }: Props) {
       )}
 
       {/* Invite + Settings */}
-      <button
-        onClick={() => void copyInvite()}
-        disabled={isAdmin && !community.reachable}
-        title={copied ? "Copied!" : isAdmin && !community.reachable ? "Seed node unreachable" : "Copy Invite Link"}
-        aria-label="Copy invite link"
-        style={{
-          background: "none",
-          border: "none",
-          color: copied ? "var(--color-bc-success)" : "var(--color-bc-muted)",
-          cursor: isAdmin && !community.reachable ? "not-allowed" : "pointer",
-          opacity: isAdmin && !community.reachable ? 0.35 : 1,
-          padding: "4px",
-          display: "flex",
-          marginLeft: "0.25rem",
-          borderRadius: "3px",
-          transition: "color 0.15s",
-        }}
-      >
-        {copied ? <Check size={16} /> : <Link2 size={16} />}
-      </button>
+      {isAdmin && (
+        <button
+          onClick={() => void copyInvite()}
+          disabled={!community.reachable}
+          title={copied ? "Copied!" : !community.reachable ? "Seed node unreachable" : "Copy Invite Link"}
+          aria-label="Copy invite link"
+          style={{
+            background: "none",
+            border: "none",
+            color: copied ? "var(--color-bc-success)" : "var(--color-bc-muted)",
+            cursor: !community.reachable ? "not-allowed" : "pointer",
+            opacity: !community.reachable ? 0.35 : 1,
+            padding: "4px",
+            display: "flex",
+            marginLeft: "0.25rem",
+            borderRadius: "3px",
+            transition: "color 0.15s",
+          }}
+        >
+          {copied ? <Check size={16} /> : <Link2 size={16} />}
+        </button>
+      )}
 
       {isAdmin && (
         <button
@@ -346,21 +326,23 @@ function DropdownMenu({
         border: "1px solid rgba(255,255,255,0.06)",
       }}
     >
-      <button
-        role="menuitem"
-        onClick={onCopyInvite}
-        disabled={isAdmin && !community.reachable}
-        title={isAdmin && !community.reachable ? "Seed node unreachable" : undefined}
-        style={{
-          ...itemStyle,
-          opacity: isAdmin && !community.reachable ? 0.4 : 1,
-          cursor: isAdmin && !community.reachable ? "not-allowed" : "pointer",
-        }}
-        onMouseEnter={(e) => { if (!(isAdmin && !community.reachable)) (e.currentTarget as HTMLElement).style.background = "var(--color-bc-surface-hover)"; }}
-        onMouseLeave={(e) => { if (!(isAdmin && !community.reachable)) (e.currentTarget as HTMLElement).style.background = "none"; }}
-      >
-        Copy Invite Link
-      </button>
+      {isAdmin && (
+        <button
+          role="menuitem"
+          onClick={onCopyInvite}
+          disabled={!community.reachable}
+          title={!community.reachable ? "Seed node unreachable" : undefined}
+          style={{
+            ...itemStyle,
+            opacity: !community.reachable ? 0.4 : 1,
+            cursor: !community.reachable ? "not-allowed" : "pointer",
+          }}
+          onMouseEnter={(e) => { if (community.reachable) (e.currentTarget as HTMLElement).style.background = "var(--color-bc-surface-hover)"; }}
+          onMouseLeave={(e) => { if (community.reachable) (e.currentTarget as HTMLElement).style.background = "none"; }}
+        >
+          Copy Invite Link
+        </button>
+      )}
       {isAdmin && (
         <button
           role="menuitem"

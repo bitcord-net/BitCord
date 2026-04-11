@@ -98,7 +98,7 @@ export class NodeProcess {
             this.logBuffer.push({
               timestamp: String(parsed["timestamp"] ?? parsed["time"] ?? new Date().toISOString()),
               level: String(parsed["level"] ?? "INFO").toUpperCase(),
-              message: String(parsed["fields"]?.["message"] ?? parsed["msg"] ?? line),
+              message: String((parsed["fields"] as Record<string, unknown> | undefined)?.["message"] ?? parsed["msg"] ?? line),
               source: this.label,
             });
           } catch {

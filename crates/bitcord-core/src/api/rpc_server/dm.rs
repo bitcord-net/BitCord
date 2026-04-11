@@ -5,11 +5,15 @@ use jsonrpsee::types::ErrorObjectOwned;
 use tracing::{debug, warn};
 
 use super::super::AppState;
+use super::super::DmPeerInfo;
 use super::super::{
     push_broadcaster,
     push_broadcaster::PushEvent,
     save_table,
-    types::{DmMessageInfo, GetDmHistoryParams, SendDmParams, SetPreferredMailboxCommunityParams},
+    types::{
+        DiscardDmParams, DmMessageInfo, GetDmHistoryParams, SendDmParams,
+        SetPreferredMailboxCommunityParams,
+    },
 };
 use super::{internal_err, invalid_params, not_found};
 use crate::{crypto::dm::DmEnvelope, identity::NodeIdentity, network::NetworkCommand};
@@ -40,10 +44,9 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
             );
         }
         // Best-effort P2P delivery: look up recipient's X25519 key, seal a DmEnvelope,
-        // and route via the NetworkHandle (direct or via seed relay).
+        // and route via the NetworkHandle (direct or via mailbox).
         {
-            let recipient_x25519_pk: Option<[u8; 32]> = {
-                // First search community member records (most up-to-date source).
+            let mut recipient_x25519_pk: Option<[u8; 32]> = {
                 let members = ctx.members.read().await;
                 let mut found = None;
                 'outer: for list in members.values() {
@@ -54,16 +57,49 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
                         }
                     }
                 }
-                // Fall back to the dm_peers cache so delivery still works after a
-                // shared community has been disbanded.
-                if found.is_none() {
-                    let dm_peers = ctx.dm_peers.read().await;
-                    if let Some(info) = dm_peers.get(&p.peer_id) {
-                        found = Some(info.x25519_public_key);
-                    }
-                }
                 found
             };
+            // Fall back to dm_peers cache (post-disbandment delivery).
+            if recipient_x25519_pk.is_none() {
+                let dm_peers = ctx.dm_peers.read().await;
+                if let Some(info) = dm_peers.get(&p.peer_id) {
+                    recipient_x25519_pk = Some(info.x25519_public_key);
+                }
+            }
+            // DHT peer info lookup: always resolve the peer's direct address for
+            // online delivery, and also fill in x25519_pk if it wasn't found locally.
+            let mut peer_node_addr: Option<crate::network::NodeAddr> = None;
+            if let Some(dht) = &ctx.dht {
+                if let Some(pid_bytes) = super::parse_fingerprint_hex(&p.peer_id) {
+                    match dht.find_peer_info(pid_bytes).await {
+                        Ok(Some(info)) => {
+                            debug!("dm_send: found peer info via DHT for {}", p.peer_id);
+                            peer_node_addr = Some(info.addr.clone());
+                            if recipient_x25519_pk.is_none() {
+                                recipient_x25519_pk = Some(info.x25519_pk);
+                                // Cache in dm_peers with the peer's real display name.
+                                let name = if info.display_name.is_empty() {
+                                    p.peer_id[..12].to_string() + "…"
+                                } else {
+                                    info.display_name.clone()
+                                };
+                                let mut dm_peers = ctx.dm_peers.write().await;
+                                dm_peers.entry(p.peer_id.clone()).or_insert(DmPeerInfo {
+                                    display_name: name,
+                                    x25519_public_key: info.x25519_pk,
+                                });
+                            }
+                        }
+                        Ok(None) => {
+                            debug!("dm_send: peer {} not found in DHT peer info", p.peer_id);
+                        }
+                        Err(e) => {
+                            debug!("dm_send: DHT peer info lookup failed: {e}");
+                        }
+                    }
+                }
+            }
+
             if let Some(x25519_pk) = recipient_x25519_pk {
                 let sender_sk = NodeIdentity::from_signing_key_bytes(&ctx.signing_key.to_bytes())
                     .x25519_secret();
@@ -90,9 +126,11 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
                             .swarm_cmd_tx
                             .send(NetworkCommand::SendDm {
                                 peer_id: p.peer_id.clone(),
+                                message_id: msg.id.clone(),
                                 recipient_x25519_pk: x25519_pk,
                                 envelope,
                                 mailbox_addr,
+                                peer_node_addr,
                             })
                             .await
                             .is_err()
@@ -104,7 +142,7 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
                 }
             } else {
                 debug!(
-                    "dm_send: recipient {} not found in any member list",
+                    "dm_send: recipient {} not found in members, dm_peers, or DHT",
                     p.peer_id
                 );
             }
@@ -192,6 +230,30 @@ pub(super) fn register_dm_methods(module: &mut RpcModule<Arc<AppState>>) -> anyh
             Ok::<String, ErrorObjectOwned>(addr_str)
         },
     )?;
+
+    // Removes a specific message from the local DM store.
+    // Called by the client after a dm_send_failed event so the message is gone on next load.
+    module.register_async_method("dm_discard", |params, ctx, _| async move {
+        let p: DiscardDmParams = params.parse().map_err(|e| invalid_params(e.to_string()))?;
+        let mut dms = ctx.dms.write().await;
+        if let Some(msgs) = dms.get_mut(&p.peer_id) {
+            msgs.retain(|m| m.id != p.message_id);
+            save_table(
+                &ctx.data_dir.join("dms.json"),
+                &*dms,
+                ctx.encryption_key.as_ref(),
+            );
+        }
+        Ok::<bool, ErrorObjectOwned>(true)
+    })?;
+
+    // Returns the cached display name for a peer from dm_peers, or null if unknown.
+    module.register_async_method("dm_peer_name", |params, ctx, _| async move {
+        let peer_id: String = params.one().map_err(|e| invalid_params(e.to_string()))?;
+        let dm_peers = ctx.dm_peers.read().await;
+        let name = dm_peers.get(&peer_id).map(|info| info.display_name.clone());
+        Ok::<Option<String>, ErrorObjectOwned>(name)
+    })?;
 
     Ok(())
 }

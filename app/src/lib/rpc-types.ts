@@ -239,7 +239,6 @@ export type NodeMode = "gossip_client" | "peer" | "headless_seed";
 
 export interface NodeConfigDto {
   listen_addrs: string[];
-  seed_nodes: string[];
   max_connections: number;
   storage_limit_mb: number;
   bandwidth_limit_kbps: number | null;
@@ -251,7 +250,6 @@ export interface NodeConfigDto {
 
 export interface SetConfigParams {
   listen_addrs?: string[];
-  seed_nodes?: string[];
   max_connections?: number;
   storage_limit_mb?: number;
   bandwidth_limit_kbps?: number | null;
@@ -360,6 +358,7 @@ export type PushEventPayload =
   | { type: "node_metrics_updated"; data: NodeMetricsSnapshot }
   | { type: "sync_progress"; data: SyncProgressData }
   | { type: "dm_new"; data: DmNewData }
+  | { type: "dm_send_failed"; data: { peer_id: string; message_id: string } }
   | { type: "channel_history_synced"; data: ChannelHistorySyncedData }
   | { type: "reaction_updated"; data: ReactionUpdatedData }
   | { type: "seed_status_changed"; data: SeedStatusData }

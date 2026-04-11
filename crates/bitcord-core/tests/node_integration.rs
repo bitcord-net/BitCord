@@ -20,6 +20,7 @@ use bitcord_core::{
     resource::connection_limiter::ConnectionLimiter,
 };
 use ed25519_dalek::Signature;
+use postcard;
 use tempfile::TempDir;
 use ulid::Ulid;
 use x25519_dalek::PublicKey;
@@ -665,6 +666,201 @@ async fn community_peer_records_are_isolated_by_community() {
         .await
         .expect("find_community_peers A");
     assert_eq!(records_a.len(), 1);
+
+    srv.server.close();
+}
+
+// ── Tests 15-18: StorePeerInfo / FindPeerInfo ─────────────────────────────────
+
+/// Open a raw QUIC connection, send `req`, and return the decoded `NodeResponse`.
+/// Reused by tests that need to inject crafted (possibly invalid) requests.
+async fn send_raw_request(srv: &TestServer, req: &ClientRequest) -> NodeResponse {
+    use bitcord_core::network::tls::client_config_pinned;
+
+    let client_cfg = client_config_pinned(srv.fingerprint()).expect("client config");
+    let mut endpoint =
+        quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().unwrap()).expect("endpoint");
+    endpoint.set_default_client_config(client_cfg);
+
+    let conn = endpoint
+        .connect(srv.addr(), "bitcord-node")
+        .unwrap()
+        .await
+        .expect("connect");
+    let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+    let frame = encode_frame(req).unwrap();
+    send.write_all(&frame).await.unwrap();
+    send.finish().unwrap();
+
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.unwrap();
+    let payload_len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; payload_len];
+    recv.read_exact(&mut payload).await.unwrap();
+    decode_payload(&payload).unwrap()
+}
+
+/// Compute the `sig_r`/`sig_s` halves for a `StorePeerInfo` announcement.
+/// Signs `peer_id || x25519_pk || postcard(addr)` with `identity`.
+fn peer_info_sig(
+    identity: &NodeIdentity,
+    peer_id: &[u8; 32],
+    x25519_pk: &[u8; 32],
+    addr: &NodeAddr,
+) -> [u8; 64] {
+    let addr_bytes = postcard::to_allocvec(addr).unwrap();
+    let mut msg = Vec::with_capacity(64 + addr_bytes.len());
+    msg.extend_from_slice(peer_id);
+    msg.extend_from_slice(x25519_pk);
+    msg.extend_from_slice(&addr_bytes);
+    identity.sign(&msg).to_bytes()
+}
+
+/// Test 15: `StorePeerInfo` + `FindPeerInfo` roundtrip with a valid signature.
+#[tokio::test]
+async fn store_and_find_peer_info_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let peer_identity = NodeIdentity::generate();
+    let peer_id: [u8; 32] = *peer_identity.to_peer_id().as_bytes();
+    let ed25519_pk: [u8; 32] = peer_identity.verifying_key().to_bytes();
+    let x25519_pk: [u8; 32] = peer_identity.x25519_public_key_bytes();
+    let addr = NodeAddr::new("127.0.0.1".parse().unwrap(), 9930);
+    let sig = peer_info_sig(&peer_identity, &peer_id, &x25519_pk, &addr);
+
+    client
+        .store_peer_info(
+            peer_id,
+            ed25519_pk,
+            x25519_pk,
+            addr,
+            "Alice".to_string(),
+            sig,
+        )
+        .await
+        .expect("store_peer_info should succeed with valid signature");
+
+    let record = client
+        .find_peer_info(peer_id)
+        .await
+        .expect("find_peer_info rpc")
+        .expect("record must be present after store");
+
+    assert_eq!(record.x25519_pk, x25519_pk, "x25519_pk must round-trip");
+    assert_eq!(record.addr.port, 9930, "addr.port must round-trip");
+    assert_eq!(record.display_name, "Alice", "display_name must round-trip");
+
+    srv.server.close();
+}
+
+/// Test 16: `StorePeerInfo` with a forged (all-zeros) signature is rejected with 400.
+#[tokio::test]
+async fn store_peer_info_bad_signature_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+
+    let peer_identity = NodeIdentity::generate();
+    let peer_id: [u8; 32] = *peer_identity.to_peer_id().as_bytes();
+    let ed25519_pk: [u8; 32] = peer_identity.verifying_key().to_bytes();
+    let x25519_pk: [u8; 32] = peer_identity.x25519_public_key_bytes();
+
+    let req = ClientRequest::StorePeerInfo {
+        peer_id,
+        ed25519_pk,
+        x25519_pk,
+        addr: NodeAddr::new("127.0.0.1".parse().unwrap(), 9931),
+        display_name: "Attacker".to_string(),
+        sig_r: [0u8; 32], // all-zeros: syntactically valid bytes but won't verify
+        sig_s: [0u8; 32],
+    };
+
+    let resp = send_raw_request(&srv, &req).await;
+    match resp {
+        NodeResponse::Error { code, .. } => {
+            assert_eq!(code, 400, "bad signature must yield 400, got {code}")
+        }
+        other => panic!("expected Error(400), got {other:?}"),
+    }
+
+    srv.server.close();
+}
+
+/// Test 17: `StorePeerInfo` where `peer_id` ≠ SHA-256(ed25519_pk) is rejected with 400,
+/// even when the signature over the crafted peer_id is otherwise valid.
+#[tokio::test]
+async fn store_peer_info_mismatched_peer_id_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+
+    let peer_identity = NodeIdentity::generate();
+    let ed25519_pk: [u8; 32] = peer_identity.verifying_key().to_bytes();
+    let x25519_pk: [u8; 32] = peer_identity.x25519_public_key_bytes();
+
+    // A peer_id that provably does not equal SHA-256 of the above ed25519_pk.
+    let wrong_peer_id = [0xBBu8; 32];
+    // Sign over wrong_peer_id anyway — valid sig, wrong identity binding.
+    let addr = NodeAddr::new("127.0.0.1".parse().unwrap(), 9932);
+    let sig = peer_info_sig(&peer_identity, &wrong_peer_id, &x25519_pk, &addr);
+    let (sig_r, sig_s): ([u8; 32], [u8; 32]) = {
+        let (r, s) = sig.split_at(32);
+        (r.try_into().unwrap(), s.try_into().unwrap())
+    };
+
+    let req = ClientRequest::StorePeerInfo {
+        peer_id: wrong_peer_id,
+        ed25519_pk,
+        x25519_pk,
+        addr,
+        display_name: "Impersonator".to_string(),
+        sig_r,
+        sig_s,
+    };
+
+    let resp = send_raw_request(&srv, &req).await;
+    match resp {
+        NodeResponse::Error { code, .. } => {
+            assert_eq!(code, 400, "mismatched peer_id must yield 400, got {code}")
+        }
+        other => panic!("expected Error(400), got {other:?}"),
+    }
+
+    srv.server.close();
+}
+
+/// Test 18: A `display_name` longer than 64 chars is silently truncated on store.
+#[tokio::test]
+async fn store_peer_info_display_name_truncated_to_64_chars() {
+    let tmp = TempDir::new().unwrap();
+    let srv = TestServer::spawn(&tmp).await;
+    let (client, _push_rx) = connect(&srv).await;
+
+    let peer_identity = NodeIdentity::generate();
+    let peer_id: [u8; 32] = *peer_identity.to_peer_id().as_bytes();
+    let ed25519_pk: [u8; 32] = peer_identity.verifying_key().to_bytes();
+    let x25519_pk: [u8; 32] = peer_identity.x25519_public_key_bytes();
+    let addr = NodeAddr::new("127.0.0.1".parse().unwrap(), 9933);
+    let sig = peer_info_sig(&peer_identity, &peer_id, &x25519_pk, &addr);
+
+    // 200 chars — well above the 64-char cap.
+    let long_name = "X".repeat(200);
+    client
+        .store_peer_info(peer_id, ed25519_pk, x25519_pk, addr, long_name, sig)
+        .await
+        .expect("store_peer_info must accept any display_name length");
+
+    let record = client
+        .find_peer_info(peer_id)
+        .await
+        .expect("find_peer_info rpc")
+        .expect("record must be present");
+
+    assert_eq!(
+        record.display_name.chars().count(),
+        64,
+        "display_name must be silently truncated to 64 chars"
+    );
 
     srv.server.close();
 }

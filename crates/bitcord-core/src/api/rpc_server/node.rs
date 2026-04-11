@@ -19,7 +19,6 @@ pub(super) fn register_node_methods(module: &mut RpcModule<Arc<AppState>>) -> an
         let cfg = ctx.config.read().await;
         let dto = NodeConfigDto {
             listen_addrs: cfg.listen_addrs.clone(),
-            seed_nodes: cfg.seed_nodes.clone(),
             max_connections: cfg.max_connections,
             storage_limit_mb: cfg.storage_limit_mb,
             bandwidth_limit_kbps: cfg.bandwidth_limit_kbps,
@@ -36,9 +35,6 @@ pub(super) fn register_node_methods(module: &mut RpcModule<Arc<AppState>>) -> an
         let mut cfg = ctx.config.write().await;
         if let Some(v) = p.listen_addrs {
             cfg.listen_addrs = v;
-        }
-        if let Some(v) = p.seed_nodes {
-            cfg.seed_nodes = v;
         }
         if let Some(v) = p.max_connections {
             cfg.max_connections = v;

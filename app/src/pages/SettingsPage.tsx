@@ -421,15 +421,12 @@ function NodeTab() {
   // local edits
   const [storageMb, setStorageMb] = useState(512);
   const [bandwidthKbps, setBandwidthKbps] = useState<number | null>(null);
-  const [seedNodes, setSeedNodes] = useState<string[]>([]);
-  const [newSeedNode, setNewSeedNode] = useState("");
 
   useEffect(() => {
     rpcClient.nodeGetConfig().then((c) => {
       setConfig(c);
       setStorageMb(c.storage_limit_mb);
       setBandwidthKbps(c.bandwidth_limit_kbps);
-      setSeedNodes([...c.seed_nodes]);
     });
     rpcClient.nodeGetMetrics().then(setMetrics);
   }, []);
@@ -441,23 +438,13 @@ function NodeTab() {
   async function save() {
     setSaving(true);
     try {
-      await rpcClient.nodeSetConfig({ storage_limit_mb: storageMb, bandwidth_limit_kbps: bandwidthKbps, seed_nodes: seedNodes });
+      await rpcClient.nodeSetConfig({ storage_limit_mb: storageMb, bandwidth_limit_kbps: bandwidthKbps });
       setSaveMsg("Saved!"); setTimeout(() => setSaveMsg(""), 2000);
     } catch {
       setSaveMsg("Failed to save");
     } finally {
       setSaving(false);
     }
-  }
-
-  function addSeedNode() {
-    if (!newSeedNode.trim() || seedNodes.includes(newSeedNode.trim())) return;
-    setSeedNodes([...seedNodes, newSeedNode.trim()]);
-    setNewSeedNode("");
-  }
-
-  function removeSeedNode(addr: string) {
-    setSeedNodes(seedNodes.filter((s) => s !== addr));
   }
 
   const GB = 1024;
@@ -528,25 +515,6 @@ function NodeTab() {
               <span style={{ fontSize: 13, color: "var(--color-bc-muted)" }}>kbps</span>
             </div>
           </SettingRow>
-
-          <div style={{ padding: "12px 0", borderBottom: "1px solid var(--color-bc-surface-3)" }}>
-            <div style={{ color: "var(--color-bc-text)", fontWeight: 500, marginBottom: 8 }}>Seed Node Addresses</div>
-            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <div style={{ flex: 1 }}>
-                <TextInput value={newSeedNode} onChange={setNewSeedNode} placeholder="e.g. 1.2.3.4:7332" />
-              </div>
-              <Btn onClick={addSeedNode} variant="ghost"><Plus size={14} /></Btn>
-            </div>
-            {seedNodes.length === 0 && <div style={{ color: "var(--color-bc-muted)", fontSize: 13 }}>No seed nodes configured</div>}
-            {seedNodes.map((addr) => (
-              <div key={addr} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, background: "var(--color-bc-surface-2)", borderRadius: 4, padding: "4px 10px" }}>
-                <span style={{ flex: 1, fontFamily: "monospace", fontSize: 12, wordBreak: "break-all" }}>{addr}</span>
-                <button onClick={() => removeSeedNode(addr)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-bc-muted)" }} aria-label="Remove seed node">
-                  <Trash2 size={13} />
-                </button>
-              </div>
-            ))}
-          </div>
 
           <div style={{ marginTop: 16, display: "flex", gap: 8, alignItems: "center" }}>
             <Btn onClick={save} disabled={saving}>{saving ? "Saving…" : "Save Node Settings"}</Btn>
@@ -828,7 +796,7 @@ function AboutTab() {
   const identity = useIdentityStore((s) => s.identity);
   const { copied, copy } = useCopyText();
   const BUILD_COMMIT = import.meta.env.VITE_BUILD_COMMIT ?? "development";
-  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.2.0";
+  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.3.0";
 
   return (
     <div>

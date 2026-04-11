@@ -473,6 +473,76 @@ impl ConnectionHandler {
                 NodeResponse::CommunityPeers(records)
             }
 
+            ClientRequest::StorePeerInfo {
+                peer_id,
+                ed25519_pk,
+                x25519_pk,
+                addr,
+                display_name,
+                sig_r,
+                sig_s,
+            } => {
+                // No authentication required — public DHT operation.
+                // Only in-memory: records received from remote nodes are ephemeral caching
+                // entries and are not written to disk. This node's own record is the only
+                // one persisted (see DhtHandle::register_peer_info).
+
+                // 1. Verify peer_id == SHA-256(ed25519_pk).
+                use sha2::{Digest, Sha256};
+                let computed: [u8; 32] = Sha256::digest(ed25519_pk.as_slice()).into();
+                if &computed != peer_id {
+                    return err(400, "peer_id does not match ed25519_pk");
+                }
+
+                // 2. Verify Ed25519 signature over peer_id || x25519_pk || postcard(addr).
+                let vk = match VerifyingKey::from_bytes(ed25519_pk) {
+                    Ok(k) => k,
+                    Err(_) => return err(400, "invalid ed25519_pk"),
+                };
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes[..32].copy_from_slice(sig_r);
+                sig_bytes[32..].copy_from_slice(sig_s);
+                let sig = Signature::from_bytes(&sig_bytes);
+                let addr_bytes = postcard::to_allocvec(addr).unwrap_or_default();
+                let mut msg = Vec::with_capacity(64 + addr_bytes.len());
+                msg.extend_from_slice(peer_id);
+                msg.extend_from_slice(x25519_pk);
+                msg.extend_from_slice(&addr_bytes);
+                if vk.verify_strict(&msg, &sig).is_err() {
+                    return err(400, "invalid peer info signature");
+                }
+
+                // 3. Cap display_name to prevent memory DoS from oversized strings.
+                let display_name: String = display_name.chars().take(64).collect();
+
+                if let Some(dht) = &services.dht {
+                    let record = bitcord_dht::PeerInfoRecord {
+                        x25519_pk: *x25519_pk,
+                        addr: addr.clone(),
+                        announced_at: bitcord_dht::DhtState::unix_now(),
+                        display_name,
+                    };
+                    dht.add_peer_info_record(*peer_id, record);
+                }
+                NodeResponse::PeerInfoAck
+            }
+
+            ClientRequest::FindPeerInfo { peer_id } => {
+                // No authentication required — public DHT operation.
+                let result = services
+                    .dht
+                    .as_ref()
+                    .and_then(|d| d.lookup_peer_info_local(*peer_id));
+                match result {
+                    Some(rec) => NodeResponse::PeerInfo {
+                        x25519_pk: rec.x25519_pk,
+                        addr: rec.addr,
+                        display_name: rec.display_name,
+                    },
+                    None => err(404, "peer not found"),
+                }
+            }
+
             ClientRequest::Heartbeat => NodeResponse::Authenticated {
                 pk: services.node_pk,
             },

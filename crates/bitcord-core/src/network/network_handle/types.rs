@@ -54,14 +54,19 @@ pub enum NetworkCommand {
     Publish { topic: String, data: Vec<u8> },
     /// Send a direct message to a peer.
     ///
-    /// `mailbox_addr` is pre-resolved by the caller via `DhtHandle`; the gossip
-    /// layer performs direct delivery only.
+    /// Delivery priority: direct connection → mailbox → peer_node_addr dial.
+    /// When both `mailbox_addr` and `peer_node_addr` are `None` and the peer
+    /// is not already connected, no delivery is attempted (mailbox-less + offline).
     SendDm {
         peer_id: String,
+        message_id: String,
         recipient_x25519_pk: [u8; 32],
         envelope: DmEnvelope,
-        /// Pre-resolved mailbox address from DhtHandle. `None` = direct-only.
+        /// Pre-resolved mailbox address from DhtHandle. `None` = no mailbox configured.
         mailbox_addr: Option<NodeAddr>,
+        /// Peer's direct QUIC address from DHT peer info. Used for online-only delivery
+        /// when the peer has no mailbox.
+        peer_node_addr: Option<NodeAddr>,
     },
     /// Request a community manifest from a peer.
     FetchManifest {
@@ -158,6 +163,10 @@ pub enum NetworkEvent {
     },
     /// A seed peer disconnected from a specific community.
     SeedPeerDisconnected { community_id: String },
+    /// A DM could not be delivered (peer offline, no mailbox, and no reachable direct addr).
+    DmSendFailed { peer_id: String, message_id: String },
+    /// A gossip peer's QUIC address was resolved — used to seed the DHT routing table.
+    PeerAddrKnown { node_pk: [u8; 32], addr: NodeAddr },
     /// A network-level error occurred.
     Error(String),
 }
@@ -167,6 +176,8 @@ pub enum NetworkEvent {
 /// Sent from a dial task to the main loop once a connection is established.
 pub(crate) struct PeerRegistration {
     pub(crate) peer_id: String,
+    /// Raw Ed25519 public key bytes of the connected peer.
+    pub(crate) node_pk: [u8; 32],
     pub(crate) client: NodeClient,
     /// Whether this peer is a seed node (i.e. was dialled with `is_seed=true`).
     pub(crate) is_seed: bool,

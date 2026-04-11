@@ -9,16 +9,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-windows:
-    name: Build Windows release
-    runs-on: windows-latest
+  build:
+    name: Build ${{ matrix.platform }} release
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-22.04
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -51,14 +72,115 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      - name: Copy standalone binary with version name
+      - name: Copy standalone binary (Windows)
+        if: matrix.platform == 'windows'
         shell: bash
-        run: cp target/release/bitcord-tauri.exe "target/release/bitcord-${{ steps.version.outputs.VERSION }}.exe"
+        run: cp target/release/bitcord-tauri.exe "target/release/bitcord-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe"
 
-      - name: Create GitHub release
+      - name: Copy standalone binary (Linux/macOS)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: cp target/release/bitcord-tauri "target/release/bitcord-${{ steps.version.outputs.VERSION }}-${{ matrix.platform }}"
+
+      - name: Upload Windows artifacts
+        if: matrix.platform == 'windows'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/bundle/msi/BitCord_${{ steps.version.outputs.VERSION }}_x64_en-US.msi
             target/release/bundle/nsis/BitCord_${{ steps.version.outputs.VERSION }}_x64-setup.exe
-            target/release/bitcord-${{ steps.version.outputs.VERSION }}.exe
+            target/release/bitcord-${{ steps.version.outputs.VERSION }}-windows-x86_64.exe
+
+      - name: Upload Linux artifacts
+        if: matrix.platform == 'linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bitcord-${{ steps.version.outputs.VERSION }}-linux
+
+      - name: Upload macOS artifacts
+        if: matrix.platform == 'macos'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bitcord-${{ steps.version.outputs.VERSION }}-macos
+
+  build-android:
+    name: Build Android release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: android-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: android-cargo-release-
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android NDK
+        run: |
+          echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm install
+        working-directory: app
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: app
+
+      - name: Decode keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > crates/bitcord-tauri/gen/android/app/bitcord-release.jks
+
+      - name: Write keystore.properties
+        run: |
+          cat > crates/bitcord-tauri/gen/android/app/keystore.properties << 'EOF'
+          storeFile=bitcord-release.jks
+          storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: Build Android APK
+        run: node ../../app/node_modules/@tauri-apps/cli/tauri.js android build --apk
+        working-directory: crates/bitcord-tauri
+
+      - name: Upload Android artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: crates/bitcord-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+      - name: Clean up keystore files
+        if: always()
+        run: |
+          rm -f crates/bitcord-tauri/gen/android/app/bitcord-release.jks
+          rm -f crates/bitcord-tauri/gen/android/app/keystore.properties

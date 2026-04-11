@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -16,7 +16,9 @@ use super::types::{NetworkCommand, NetworkEvent, PeerRegistration, SeedPeerInfo,
 pub(crate) async fn handle_command(
     cmd: NetworkCommand,
     peers: &mut HashMap<String, NodeClient>,
+    sha256_map: &mut HashMap<String, String>,
     seed_peers: &mut HashMap<String, SeedPeerInfo>,
+    seed_reconnect_cancels: &mut HashMap<String, oneshot::Sender<()>>,
     identity: &Arc<NodeIdentity>,
     peer_reg_tx: &mpsc::Sender<PeerRegistration>,
     gossip_evt_tx: &mpsc::Sender<NetworkEvent>,
@@ -39,6 +41,19 @@ pub(crate) async fn handle_command(
             let own_pk = own_pk_hex.to_string();
             let evt_tx = evt_tx.clone();
             let own_addrs = Arc::clone(own_addrs);
+
+            // Pre-create a cancel channel so the reconnect loop (if spawned on
+            // dial failure) can be stopped later via NetworkCommand cancellation.
+            // The Sender is stored immediately; if dial succeeds the Receiver is
+            // dropped and the entry becomes a harmless closed channel.
+            let cancel_rx = if is_seed {
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                seed_reconnect_cancels.insert(addr.to_string(), cancel_tx);
+                Some(cancel_rx)
+            } else {
+                None
+            };
+
             tokio::spawn(async move {
                 match NodeClient::connect(
                     addr.clone(),
@@ -48,6 +63,11 @@ pub(crate) async fn handle_command(
                 .await
                 {
                     Ok((client, node_pk, push_rx)) => {
+                        // Dial succeeded — drop the cancel receiver so the stored
+                        // Sender closes cleanly. A new cancel channel will be
+                        // created if this peer later drops and needs a reconnect loop.
+                        drop(cancel_rx);
+
                         let peer_id = node_pk
                             .iter()
                             .map(|b| format!("{b:02x}"))
@@ -64,6 +84,7 @@ pub(crate) async fn handle_command(
                         let _ = reg_tx
                             .send(PeerRegistration {
                                 peer_id: peer_id.clone(),
+                                node_pk,
                                 client: client.clone(),
                                 is_seed,
                                 addr,
@@ -114,6 +135,7 @@ pub(crate) async fn handle_command(
                         if is_seed {
                             let addr_str = addr.to_string();
                             if own_addrs.read().await.contains(&addr_str) {
+                                drop(cancel_rx);
                                 info!(%addr, "gossip: dial target is own address; skipping reconnect loop");
                                 if let Some((_, community_id)) = join_community {
                                     // Self-hosted seed: no remote peer_id available.
@@ -132,6 +154,8 @@ pub(crate) async fn handle_command(
                                         })
                                         .await;
                                 }
+                                // cancel_rx is Some here since is_seed is true
+                                let cancel_rx = cancel_rx.expect("cancel_rx set for seeds");
                                 info!(%addr, "scheduling reconnect loop after initial dial failure");
                                 tokio::spawn(reconnect_seed_loop(
                                     addr,
@@ -143,6 +167,7 @@ pub(crate) async fn handle_command(
                                     join_community_password,
                                     cert_fingerprint,
                                     own_addrs,
+                                    cancel_rx,
                                 ));
                             }
                         }
@@ -203,6 +228,7 @@ pub(crate) async fn handle_command(
                             let _ = reg_tx
                                 .send(PeerRegistration {
                                     peer_id,
+                                    node_pk: node_pk_bytes,
                                     client,
                                     is_seed: false,
                                     addr,
@@ -239,6 +265,8 @@ pub(crate) async fn handle_command(
             }
             for id in dead {
                 peers.remove(&id);
+                // Clean up the SHA256 reverse index so it doesn't grow unboundedly.
+                sha256_map.retain(|_, v| peers.contains_key(v));
                 let _ = evt_tx
                     .send(NetworkEvent::PeerDisconnected(id.clone()))
                     .await;
@@ -257,6 +285,8 @@ pub(crate) async fn handle_command(
                     let evt_fwd = gossip_evt_tx.clone();
                     let own_pk = own_pk_hex.to_string();
                     info!(peer_id = %id, %addr, "seed peer lost; scheduling reconnect loop");
+                    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                    seed_reconnect_cancels.insert(addr.to_string(), cancel_tx);
                     tokio::spawn(reconnect_seed_loop(
                         addr,
                         identity_clone,
@@ -267,6 +297,7 @@ pub(crate) async fn handle_command(
                         join_community_password,
                         cert_fingerprint,
                         Arc::clone(own_addrs),
+                        cancel_rx,
                     ));
                 }
             }
@@ -411,46 +442,97 @@ pub(crate) async fn handle_command(
 
         NetworkCommand::SendDm {
             peer_id,
+            message_id,
             recipient_x25519_pk,
             envelope,
             mailbox_addr,
+            peer_node_addr,
         } => {
-            // Try direct connection first.
-            let direct_client = peers.get(&peer_id).cloned();
+            // Priority 1: already-connected direct peer.
+            // peer_id may be SHA256(node_pk) — resolve to raw pk via the index first.
+            let raw_pk = sha256_map
+                .get(&peer_id)
+                .map(|s| s.as_str())
+                .unwrap_or(&peer_id);
+            let direct_client = peers.get(raw_pk).cloned();
             if let Some(client) = direct_client {
+                let evt_tx = evt_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = client.send_dm(recipient_x25519_pk, envelope).await {
-                        warn!(%peer_id, "dm: send failed: {e}");
+                        warn!(%peer_id, "dm: direct send failed: {e}");
+                        let _ = evt_tx
+                            .send(NetworkEvent::DmSendFailed {
+                                peer_id,
+                                message_id,
+                            })
+                            .await;
                     }
                 });
             } else if let Some(addr) = mailbox_addr {
-                // Caller pre-resolved the mailbox address via DhtHandle.
+                // Priority 2: pre-resolved mailbox address (store-and-forward).
                 let identity_clone = Arc::clone(identity);
+                let evt_tx = evt_tx.clone();
                 tokio::spawn(async move {
                     match NodeClient::connect(addr.clone(), [0u8; 32], identity_clone).await {
                         Ok((client, _, _)) => {
                             if let Err(e) = client.send_dm(recipient_x25519_pk, envelope).await {
                                 warn!(%peer_id, "dm: mailbox send failed: {e}");
+                                let _ = evt_tx
+                                    .send(NetworkEvent::DmSendFailed {
+                                        peer_id,
+                                        message_id,
+                                    })
+                                    .await;
                             }
                         }
-                        Err(e) => warn!(%peer_id, "dm: connect to mailbox failed: {e}"),
+                        Err(e) => {
+                            warn!(%peer_id, "dm: connect to mailbox failed: {e}");
+                            let _ = evt_tx
+                                .send(NetworkEvent::DmSendFailed {
+                                    peer_id,
+                                    message_id,
+                                })
+                                .await;
+                        }
+                    }
+                });
+            } else if let Some(addr) = peer_node_addr {
+                // Priority 3: DHT-discovered direct peer address (online-only delivery).
+                let identity_clone = Arc::clone(identity);
+                let evt_tx = evt_tx.clone();
+                tokio::spawn(async move {
+                    match NodeClient::connect(addr.clone(), [0u8; 32], identity_clone).await {
+                        Ok((client, _, _)) => {
+                            if let Err(e) = client.send_dm(recipient_x25519_pk, envelope).await {
+                                warn!(%peer_id, "dm: direct-addr send failed: {e}");
+                                let _ = evt_tx
+                                    .send(NetworkEvent::DmSendFailed {
+                                        peer_id,
+                                        message_id,
+                                    })
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%peer_id, "dm: connect to peer addr failed (peer likely offline): {e:#}");
+                            let _ = evt_tx
+                                .send(NetworkEvent::DmSendFailed {
+                                    peer_id,
+                                    message_id,
+                                })
+                                .await;
+                        }
                     }
                 });
             } else {
-                // Last resort: any seed peer for store-and-forward.
-                let seed_client = seed_peers
-                    .keys()
-                    .next()
-                    .and_then(|id| peers.get(id).cloned());
-                if let Some(seed) = seed_client {
-                    tokio::spawn(async move {
-                        if let Err(e) = seed.send_dm(recipient_x25519_pk, envelope).await {
-                            warn!(%peer_id, "dm: seed fallback send failed: {e}");
-                        }
-                    });
-                } else {
-                    warn!(%peer_id, "dm: no route to peer");
-                }
+                // No mailbox and no known peer address — peer is mailbox-less and not online.
+                warn!(%peer_id, "dm: no route to peer (no mailbox, not connected, no known addr)");
+                let _ = evt_tx
+                    .send(NetworkEvent::DmSendFailed {
+                        peer_id,
+                        message_id,
+                    })
+                    .await;
             }
         }
 

@@ -358,6 +358,79 @@ impl NodeClient {
         }
     }
 
+    // ── Peer info DHT ─────────────────────────────────────────────────────
+
+    /// Store a peer info record (x25519_pk + addr) on the remote node.
+    ///
+    /// `ed25519_pk` and `sig` are the announcer's public key and Ed25519 signature
+    /// over `peer_id || x25519_pk`; the remote node verifies them before accepting.
+    ///
+    /// Does not require prior authentication.
+    pub async fn store_peer_info(
+        &self,
+        peer_id: [u8; 32],
+        ed25519_pk: [u8; 32],
+        x25519_pk: [u8; 32],
+        addr: NodeAddr,
+        display_name: String,
+        sig: [u8; 64],
+    ) -> Result<()> {
+        let mut sig_r = [0u8; 32];
+        let mut sig_s = [0u8; 32];
+        sig_r.copy_from_slice(&sig[..32]);
+        sig_s.copy_from_slice(&sig[32..]);
+        let resp = self
+            .mgr
+            .request(&ClientRequest::StorePeerInfo {
+                peer_id,
+                ed25519_pk,
+                x25519_pk,
+                addr,
+                display_name,
+                sig_r,
+                sig_s,
+            })
+            .await?;
+        match resp {
+            NodeResponse::PeerInfoAck => Ok(()),
+            NodeResponse::Error { code, msg } => {
+                bail!("store_peer_info failed (code={code}): {msg}")
+            }
+            other => bail!("unexpected store_peer_info response: {other:?}"),
+        }
+    }
+
+    /// Query a remote node for peer info (x25519_pk + addr) by `peer_id`.
+    ///
+    /// Returns `None` if the remote node has no record for this peer.
+    /// Does not require prior authentication.
+    pub async fn find_peer_info(
+        &self,
+        peer_id: [u8; 32],
+    ) -> Result<Option<bitcord_dht::PeerInfoRecord>> {
+        let resp = self
+            .mgr
+            .request(&ClientRequest::FindPeerInfo { peer_id })
+            .await?;
+        match resp {
+            NodeResponse::PeerInfo {
+                x25519_pk,
+                addr,
+                display_name,
+            } => Ok(Some(bitcord_dht::PeerInfoRecord {
+                x25519_pk,
+                addr,
+                announced_at: bitcord_dht::DhtState::unix_now(),
+                display_name,
+            })),
+            NodeResponse::Error { code: 404, .. } => Ok(None),
+            NodeResponse::Error { code, msg } => {
+                bail!("find_peer_info failed (code={code}): {msg}")
+            }
+            other => bail!("unexpected find_peer_info response: {other:?}"),
+        }
+    }
+
     // ── Gossip relay ──────────────────────────────────────────────────────
 
     /// Relay a gossip message on a topic via this node.

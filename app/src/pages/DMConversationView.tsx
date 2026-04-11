@@ -152,7 +152,7 @@ function DmMessageBubble({
         display: "flex",
         gap: "0.625rem",
         padding: isGrouped ? "1px 1rem 2px" : "0.5rem 1rem 2px",
-        opacity: isPending ? 0.6 : 1,
+        opacity: isPending || isFailed ? 0.7 : 1,
         background: hovered ? "rgba(255,255,255,0.02)" : "transparent",
         transition: "background 0.05s",
         position: "relative",
@@ -302,13 +302,17 @@ function DmMessageBubble({
 
         {isFailed && (
           <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "2px" }}>
-            <span style={{ fontSize: "0.75rem", color: "var(--color-bc-danger)" }}>Failed to send.</span>
-            <button
-              onClick={msg._onRetry}
-              style={{ fontSize: "0.75rem", color: "var(--color-bc-accent)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-            >
-              Retry
-            </button>
+            <span style={{ fontSize: "0.75rem", color: "var(--color-bc-danger)" }}>
+              {msg._onRetry ? "Failed to send." : "Not delivered — peer may be offline."}
+            </span>
+            {msg._onRetry && (
+              <button
+                onClick={msg._onRetry}
+                style={{ fontSize: "0.75rem", color: "var(--color-bc-accent)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+              >
+                Retry
+              </button>
+            )}
           </div>
         )}
 
@@ -412,18 +416,20 @@ export function DMConversationView() {
   } = useDmsStore();
 
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [cachedPeerName, setCachedPeerName] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [replyToId, setReplyToId] = useState<string | null>(null);
   const [pendingMessages, setPendingMessages] = useState<PendingDm[]>([]);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [failedMessageIds, setFailedMessageIds] = useState<Set<string>>(new Set());
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const loadedPeerRef = useRef<string | null>(null);
   const isAtBottomRef = useRef(true);
 
-  // Resolve peer display name: community members → stored conversation → truncated ID
+  // Resolve peer display name: community members → stored conversation → DHT cache → truncated ID
   const isMobile = useIsMobile();
   const peerDisplayName = useMemo(() => {
     if (!peerId) return "Unknown";
@@ -435,8 +441,18 @@ export function DMConversationView() {
     if (storedConv?.displayName && !storedConv.displayName.endsWith("…")) {
       return storedConv.displayName;
     }
+    if (cachedPeerName) return cachedPeerName;
     return peerId.slice(0, 12) + "…";
-  }, [peerId, allMembers, conversations]);
+  }, [peerId, allMembers, conversations, cachedPeerName]);
+
+  // Fetch peer display name from DHT cache when not found in community members
+  useEffect(() => {
+    if (!peerId) return;
+    setCachedPeerName(null);
+    void rpcClient.dmPeerName(peerId).then((name) => {
+      if (name) setCachedPeerName(name);
+    });
+  }, [peerId]);
 
   const peerStatus = peerId ? getStatus(peerId) : "offline";
   const myId = identity?.peer_id ?? "";
@@ -505,6 +521,11 @@ export function DMConversationView() {
       .finally(() => setIsInitialLoading(false));
   }, [peerId, peerDisplayName, setHistory, clearUnread, upsertConversation]);
 
+  // Clear failed message tracking when switching conversations
+  useEffect(() => {
+    setFailedMessageIds(new Set());
+  }, [peerId]);
+
   // Subscribe to incoming DMs
   useSubscription("dm_new", (ev) => {
     const msg = ev.data.message;
@@ -515,6 +536,15 @@ export function DMConversationView() {
     } else {
       appendMessage(convPeerId, msg);
       useDmsStore.getState().incrementUnread(convPeerId);
+    }
+  });
+
+  // Subscribe to DM delivery failures — flag the message this session and discard
+  // from the backend so it's absent from dm_get_history on next load (ephemeral).
+  useSubscription("dm_send_failed", (ev) => {
+    if (ev.data.peer_id === peerId) {
+      setFailedMessageIds((prev) => new Set(prev).add(ev.data.message_id));
+      void rpcClient.dmDiscard(ev.data.peer_id, ev.data.message_id);
     }
   });
 
@@ -749,7 +779,7 @@ export function DMConversationView() {
           {groupedMsgs.map(({ msg, isGrouped, replyMsg }) => (
             <div key={msg.id} data-msg-id={msg.id}>
               <DmMessageBubble
-                msg={msg}
+                msg={failedMessageIds.has(msg.id) ? { ...msg, _status: "failed" } : msg}
                 isOwn={msg.author_id === myId}
                 authorName={
                   msg.author_id === myId

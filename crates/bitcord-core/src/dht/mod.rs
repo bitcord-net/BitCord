@@ -22,12 +22,20 @@ use anyhow::{Context, Result};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use bitcord_dht::{CommunityPeerRecord, DhtState, DhtStore, NodeAddr, NodeId, spawn_expiry_task};
+use bitcord_dht::{
+    CommunityPeerRecord, DhtState, DhtStore, NodeAddr, NodeId, PeerInfoRecord, spawn_expiry_task,
+};
 
 use crate::identity::NodeIdentity;
 use crate::network::client::NodeClient;
 
 use kademlia::{DhtConnCache, kademlia_find_community_peers, kademlia_lookup};
+
+/// Hard-coded well-known public BitCord bootstrap nodes.
+///
+/// Format: `"host:port"` strings. Entries may be either `ip:port` or
+/// `hostname:port`; the latter are resolved via DNS at runtime.
+pub const BOOTSTRAP_NODES: &[&str] = &["bitcord.net:9042"];
 
 // ── DhtConfig ─────────────────────────────────────────────────────────────────
 
@@ -77,6 +85,8 @@ impl DhtHandle {
             Ok(records) => {
                 let count = records.len();
                 for (community_pk, record) in records {
+                    // Seed routing table so Kademlia walks have a starting point.
+                    state.add_peer(NodeId(record.node_pk), record.addr.clone());
                     state.add_community_peer_record(community_pk, record);
                 }
                 if count > 0 {
@@ -132,14 +142,21 @@ impl DhtHandle {
         if let Some(addr) = inner.state.lookup_mailbox(&user_pk) {
             return Ok(vec![addr]);
         }
-        if let Some(addr) = kademlia_lookup(
-            &user_pk,
-            &inner.state,
-            Arc::clone(&inner.identity),
-            Arc::clone(&inner.conn_cache),
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            kademlia_lookup(
+                &user_pk,
+                &inner.state,
+                Arc::clone(&inner.identity),
+                Arc::clone(&inner.conn_cache),
+            ),
         )
         .await
-        {
+        .unwrap_or_else(|_| {
+            debug!("DHT: kademlia_lookup (mailbox) timed out after 5s");
+            None
+        });
+        if let Some(addr) = result {
             return Ok(vec![addr]);
         }
         Ok(vec![])
@@ -208,11 +225,16 @@ impl DhtHandle {
             .announce_community_peer(community_pk, own_node_pk, self_addr.clone());
         // Propagate to K closest peers.
         let closest = inner.state.closest_peers(&NodeId(community_pk), 20);
+        let community_short = community_pk
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         info!(
             addr = %self_addr,
-            peers = closest.len(),
-            community_pk = %community_pk.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "DHT: announcing community presence"
+            routing_peers = closest.len(),
+            community = %community_short,
+            "DHT: announcing presence"
         );
         for (_, peer_addr) in closest {
             let identity = Arc::clone(&inner.identity);
@@ -261,6 +283,118 @@ impl DhtHandle {
         self.0.state.add_community_peer_record(community_pk, record);
     }
 
+    /// Inject a peer info record received from another node (also persists to store).
+    pub fn add_peer_info_record(&self, peer_id: [u8; 32], record: PeerInfoRecord) {
+        self.0.state.add_peer_info_record(peer_id, record);
+    }
+
+    /// Local-only peer info lookup (no QUIC).
+    pub fn lookup_peer_info_local(&self, peer_id: [u8; 32]) -> Option<PeerInfoRecord> {
+        self.0.state.lookup_peer_info(&peer_id)
+    }
+
+    /// Announce this node's own peer info to the DHT and propagate to K closest peers.
+    ///
+    /// Should be called on startup (after self_addr is known) and periodically re-announced.
+    pub async fn register_peer_info(
+        &self,
+        peer_id: [u8; 32],
+        x25519_pk: [u8; 32],
+        display_name: String,
+    ) {
+        let inner = &self.0;
+        let Some(self_addr) = inner.state.self_addr() else {
+            debug!("register_peer_info: self_addr unknown, skipping");
+            return;
+        };
+        inner
+            .state
+            .announce_peer_info(peer_id, x25519_pk, self_addr.clone(), display_name.clone());
+        let record = PeerInfoRecord {
+            x25519_pk,
+            addr: self_addr.clone(),
+            announced_at: DhtState::unix_now(),
+            display_name: display_name.clone(),
+        };
+        if let Err(e) = inner.store.set_peer_info_record(&peer_id, &record) {
+            debug!("register_peer_info: failed to persist: {e}");
+        }
+        // Propagate to K closest peers.
+        let closest = inner.state.closest_peers(&NodeId(peer_id), 20);
+        info!(
+            addr = %self_addr,
+            routing_peers = closest.len(),
+            "DHT: announcing peer info"
+        );
+        // Sign peer_id || x25519_pk || postcard(addr) so remote nodes can verify
+        // both the key binding and the address — prevents addr-swap relay attacks.
+        let addr_bytes = postcard::to_allocvec(&self_addr).unwrap_or_default();
+        let mut sig_msg = Vec::with_capacity(64 + addr_bytes.len());
+        sig_msg.extend_from_slice(&peer_id);
+        sig_msg.extend_from_slice(&x25519_pk);
+        sig_msg.extend_from_slice(&addr_bytes);
+        let sig_bytes = inner.identity.sign(&sig_msg).to_bytes();
+        let ed25519_pk: [u8; 32] = *inner.identity.verifying_key().as_bytes();
+
+        for (_, peer_addr) in closest {
+            let identity = Arc::clone(&inner.identity);
+            let cache = Arc::clone(&inner.conn_cache);
+            let record_copy = record.clone();
+            let peer_id_copy = peer_id;
+            tokio::spawn(async move {
+                if let Some(client) = kademlia::dht_connect(&peer_addr, &cache, identity).await {
+                    if let Err(e) = client
+                        .store_peer_info(
+                            peer_id_copy,
+                            ed25519_pk,
+                            record_copy.x25519_pk,
+                            record_copy.addr,
+                            record_copy.display_name,
+                            sig_bytes,
+                        )
+                        .await
+                    {
+                        debug!("register_peer_info propagation failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Find a peer's info (x25519_pk + addr) by peer_id.
+    ///
+    /// Checks local cache first, then performs an iterative Kademlia lookup.
+    pub async fn find_peer_info(&self, peer_id: [u8; 32]) -> Result<Option<PeerInfoRecord>> {
+        let inner = &self.0;
+        if let Some(record) = inner.state.lookup_peer_info(&peer_id) {
+            debug!("DHT: peer info found in local cache");
+            return Ok(Some(record));
+        }
+        info!(
+            routing_table_size = inner.state.closest_peers(&NodeId(peer_id), 20).len(),
+            "DHT: searching peer info via Kademlia walk"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            kademlia::kademlia_find_peer_info(
+                &peer_id,
+                &inner.state,
+                Arc::clone(&inner.identity),
+                Arc::clone(&inner.conn_cache),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            debug!("DHT: kademlia_find_peer_info timed out after 5s");
+            None
+        });
+        if let Some(ref rec) = result {
+            // Cache the discovered record.
+            inner.state.add_peer_info_record(peer_id, rec.clone());
+        }
+        Ok(result)
+    }
+
     /// Return closest peers to `target` from the local routing table.
     pub fn closest_peers(&self, target: [u8; 32], k: usize) -> Vec<(NodeId, NodeAddr)> {
         self.0.state.closest_peers(&NodeId(target), k)
@@ -292,7 +426,6 @@ impl DhtHandle {
     ///
     /// Fires-and-forgets each dial; errors are logged but not propagated.
     pub async fn bootstrap(&self) {
-        use crate::config::bootstrap::BOOTSTRAP_NODES;
         use std::net::ToSocketAddrs;
 
         for addr_str in BOOTSTRAP_NODES {

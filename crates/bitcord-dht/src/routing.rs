@@ -8,6 +8,7 @@
 //! # Record types
 //! - `mailbox/<user_pk>` → `(NodeAddr, expires_at)` — which node holds a user's mailbox
 //! - `community_peers/<community_pk>` → `[(node_pk, NodeAddr, announced_at)]` — peers in a community
+//! - `peer_info/<peer_id>` → `(x25519_pk, NodeAddr, announced_at)` — peer's encryption key and address
 
 use std::{
     collections::HashMap,
@@ -27,6 +28,9 @@ const MAILBOX_TTL: Duration = Duration::from_secs(86_400);
 
 /// Community peer record TTL: 1 hour (in seconds).
 pub const COMMUNITY_PEER_TTL_SECS: u64 = 3600;
+
+/// Peer info record TTL: 24 hours.
+pub const PEER_INFO_TTL_SECS: u64 = 86_400;
 
 // ── NodeId ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +85,25 @@ pub struct CommunityPeerRecord {
     pub announced_at: u64,
 }
 
+// ── PeerInfoRecord ────────────────────────────────────────────────────────────
+
+/// A record advertising a peer's X25519 encryption key and current QUIC address.
+///
+/// Keyed by `peer_id` (SHA-256 of the peer's Ed25519 verifying key).
+/// `announced_at` is a Unix timestamp (seconds) for TTL-based expiry.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoRecord {
+    /// X25519 public key for DM envelope encryption.
+    pub x25519_pk: [u8; 32],
+    /// Primary (public) network address where the peer is reachable.
+    pub addr: NodeAddr,
+    /// Unix timestamp (seconds) when this record was last announced.
+    pub announced_at: u64,
+    /// Human-readable display name chosen by the peer.
+    #[serde(default)]
+    pub display_name: String,
+}
+
 // ── KBucket ───────────────────────────────────────────────────────────────────
 
 struct KBucket {
@@ -124,6 +147,8 @@ pub struct DhtState {
     mailboxes: Arc<Mutex<HashMap<[u8; 32], MailboxRecord>>>,
     /// Community peer records: community_pk → list of known peer records.
     community_peers: Mutex<HashMap<[u8; 32], Vec<CommunityPeerRecord>>>,
+    /// Peer info records: peer_id → PeerInfoRecord (x25519_pk + addr).
+    peer_infos: Mutex<HashMap<[u8; 32], PeerInfoRecord>>,
     /// Last time `DiscoverAndDial` was run per community_pk.
     last_discover: Mutex<HashMap<[u8; 32], Instant>>,
     /// Last time community presence was announced per community_pk.
@@ -142,6 +167,7 @@ impl DhtState {
             routing_table: Mutex::new(routing_table),
             mailboxes: Arc::new(Mutex::new(HashMap::new())),
             community_peers: Mutex::new(HashMap::new()),
+            peer_infos: Mutex::new(HashMap::new()),
             last_discover: Mutex::new(HashMap::new()),
             last_announce: Mutex::new(HashMap::new()),
         }
@@ -314,6 +340,46 @@ impl DhtState {
         self.community_peers.lock().unwrap().clone()
     }
 
+    // ── Peer info records ─────────────────────────────────────────────────
+
+    /// Announce this node's own peer info (x25519_pk + addr + display_name), keyed by `peer_id`.
+    pub fn announce_peer_info(
+        &self,
+        peer_id: [u8; 32],
+        x25519_pk: [u8; 32],
+        addr: NodeAddr,
+        display_name: String,
+    ) {
+        let now = Self::unix_now();
+        self.peer_infos.lock().unwrap().insert(
+            peer_id,
+            PeerInfoRecord {
+                x25519_pk,
+                addr,
+                announced_at: now,
+                display_name,
+            },
+        );
+    }
+
+    /// Look up a cached peer info record by `peer_id`.
+    pub fn lookup_peer_info(&self, peer_id: &[u8; 32]) -> Option<PeerInfoRecord> {
+        let now = Self::unix_now();
+        let infos = self.peer_infos.lock().unwrap();
+        infos.get(peer_id).and_then(|rec| {
+            if now.saturating_sub(rec.announced_at) < PEER_INFO_TTL_SECS {
+                Some(rec.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Inject a peer info record received from another node.
+    pub fn add_peer_info_record(&self, peer_id: [u8; 32], record: PeerInfoRecord) {
+        self.peer_infos.lock().unwrap().insert(peer_id, record);
+    }
+
     // ── Expiry ────────────────────────────────────────────────────────────
 
     pub fn expire_records(&self) {
@@ -323,6 +389,7 @@ impl DhtState {
             .unwrap()
             .retain(|_, rec| rec.expires_at > now);
         self.expire_community_peers();
+        self.expire_peer_infos();
     }
 
     fn expire_community_peers(&self) {
@@ -332,6 +399,14 @@ impl DhtState {
             list.retain(|r| now.saturating_sub(r.announced_at) < COMMUNITY_PEER_TTL_SECS);
         }
         peers.retain(|_, list| !list.is_empty());
+    }
+
+    fn expire_peer_infos(&self) {
+        let now = Self::unix_now();
+        self.peer_infos
+            .lock()
+            .unwrap()
+            .retain(|_, rec| now.saturating_sub(rec.announced_at) < PEER_INFO_TTL_SECS);
     }
 }
 
@@ -458,5 +533,105 @@ mod tests {
         }
         let records = dht.lookup_community_peers(&community_pk);
         assert!(records.len() <= K);
+    }
+
+    // ── PeerInfoRecord tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn announce_and_lookup_peer_info() {
+        let dht = DhtState::new([1u8; 32], None);
+        let peer_id = [42u8; 32];
+        let x25519_pk = [7u8; 32];
+        dht.announce_peer_info(peer_id, x25519_pk, addr(9200), "Alice".to_string());
+        let rec = dht
+            .lookup_peer_info(&peer_id)
+            .expect("record should be present");
+        assert_eq!(rec.x25519_pk, x25519_pk);
+        assert_eq!(rec.addr.port, 9200);
+        assert_eq!(rec.display_name, "Alice");
+    }
+
+    #[test]
+    fn peer_info_overwritten_on_re_announce() {
+        let dht = DhtState::new([1u8; 32], None);
+        let peer_id = [43u8; 32];
+        dht.announce_peer_info(peer_id, [1u8; 32], addr(9201), "OldName".to_string());
+        dht.announce_peer_info(peer_id, [2u8; 32], addr(9202), "NewName".to_string());
+        let rec = dht
+            .lookup_peer_info(&peer_id)
+            .expect("record should be present");
+        assert_eq!(rec.x25519_pk, [2u8; 32]);
+        assert_eq!(rec.addr.port, 9202);
+        assert_eq!(rec.display_name, "NewName");
+    }
+
+    #[test]
+    fn peer_info_add_record_then_lookup() {
+        let dht = DhtState::new([1u8; 32], None);
+        let peer_id = [44u8; 32];
+        let record = PeerInfoRecord {
+            x25519_pk: [9u8; 32],
+            addr: addr(9203),
+            announced_at: DhtState::unix_now(),
+            display_name: "Bob".to_string(),
+        };
+        dht.add_peer_info_record(peer_id, record);
+        let rec = dht
+            .lookup_peer_info(&peer_id)
+            .expect("injected record should be present");
+        assert_eq!(rec.x25519_pk, [9u8; 32]);
+        assert_eq!(rec.display_name, "Bob");
+    }
+
+    #[test]
+    fn peer_info_unknown_returns_none() {
+        let dht = DhtState::new([1u8; 32], None);
+        assert!(dht.lookup_peer_info(&[99u8; 32]).is_none());
+    }
+
+    #[test]
+    fn expired_peer_info_removed_by_expire_records() {
+        let dht = DhtState::new([1u8; 32], None);
+        let peer_id = [45u8; 32];
+        // Insert a record with an announced_at that is already beyond the TTL.
+        let expired_at = DhtState::unix_now().saturating_sub(PEER_INFO_TTL_SECS + 1);
+        dht.add_peer_info_record(
+            peer_id,
+            PeerInfoRecord {
+                x25519_pk: [3u8; 32],
+                addr: addr(9204),
+                announced_at: expired_at,
+                display_name: String::new(),
+            },
+        );
+        // lookup_peer_info should already suppress the expired record...
+        assert!(
+            dht.lookup_peer_info(&peer_id).is_none(),
+            "expired record should not be returned by lookup"
+        );
+        // ...and expire_records should physically remove it.
+        dht.expire_records();
+        assert!(
+            dht.peer_infos.lock().unwrap().is_empty(),
+            "expired record should be removed by expire_records"
+        );
+    }
+
+    #[test]
+    fn peer_info_round_trips_via_postcard() {
+        // Serialize a PeerInfoRecord through postcard (the wire format used by the DHT store)
+        // and verify it round-trips cleanly, including the display_name field.
+        let original = PeerInfoRecord {
+            x25519_pk: [5u8; 32],
+            addr: addr(9205),
+            announced_at: 1_700_000_000,
+            display_name: "Charlie".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&original).expect("serialize");
+        let decoded: PeerInfoRecord = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.x25519_pk, original.x25519_pk);
+        assert_eq!(decoded.addr.port, original.addr.port);
+        assert_eq!(decoded.announced_at, original.announced_at);
+        assert_eq!(decoded.display_name, "Charlie");
     }
 }

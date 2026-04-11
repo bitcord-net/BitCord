@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::push_broadcaster::{CommunityEventData, PushEvent, SeedStatusData};
+use super::push_broadcaster::{CommunityEventData, DmSendFailedData, PushEvent, SeedStatusData};
 use super::{AppState, remove_community_local};
 use crate::network::{NetworkCommand, NetworkEvent as SwarmEvent};
 
@@ -290,7 +290,71 @@ pub async fn process_swarm_events(mut event_rx: mpsc::Receiver<SwarmEvent>, stat
                             let dht2 = dht.clone();
                             tokio::spawn(async move { dht2.register_community_peer(cpk).await });
                         }
+                        // Also re-announce peer info now that self_addr is known.
+                        let sk_bytes = state.signing_key.to_bytes();
+                        let identity =
+                            crate::identity::NodeIdentity::from_signing_key_bytes(&sk_bytes);
+                        let peer_id_bytes = *identity.to_peer_id().as_bytes();
+                        let x25519_pk = identity.x25519_public_key_bytes();
+                        let display_name = state
+                            .config
+                            .read()
+                            .await
+                            .display_name
+                            .clone()
+                            .unwrap_or_default();
+                        let dht3 = dht.clone();
+                        tokio::spawn(async move {
+                            dht3.register_peer_info(peer_id_bytes, x25519_pk, display_name)
+                                .await;
+                        });
                     }
+                }
+            }
+
+            SwarmEvent::DmSendFailed {
+                peer_id,
+                message_id,
+            } => {
+                use tracing::debug;
+                debug!(%peer_id, %message_id, "dm delivery failed: peer offline, no mailbox, no reachable addr");
+                state
+                    .broadcaster
+                    .send(PushEvent::DmSendFailed(DmSendFailedData {
+                        peer_id,
+                        message_id,
+                    }));
+            }
+
+            SwarmEvent::PeerAddrKnown { node_pk, addr } => {
+                // Seed the DHT routing table so Kademlia walks have a starting point.
+                if let Some(dht) = &state.dht {
+                    use tracing::info;
+                    info!(%addr, "DHT: seeded routing table from gossip peer");
+                    dht.add_known_peer(node_pk, addr);
+
+                    // Eagerly re-announce our own peer info to this new peer.
+                    // This fixes the startup race where register_peer_info fires
+                    // before bootstrap populates the routing table, causing our
+                    // x25519 key + address to not reach the new peer for 3600 s.
+                    let dht_clone = Arc::clone(dht);
+                    let signing_key_bytes = state.signing_key.to_bytes();
+                    let config_clone = Arc::clone(&state.config);
+                    tokio::spawn(async move {
+                        use crate::identity::NodeIdentity;
+                        let ni = NodeIdentity::from_signing_key_bytes(&signing_key_bytes);
+                        let peer_id = *ni.to_peer_id().as_bytes();
+                        let x25519_pk = ni.x25519_public_key_bytes();
+                        let display_name = config_clone
+                            .read()
+                            .await
+                            .display_name
+                            .clone()
+                            .unwrap_or_default();
+                        dht_clone
+                            .register_peer_info(peer_id, x25519_pk, display_name)
+                            .await;
+                    });
                 }
             }
 

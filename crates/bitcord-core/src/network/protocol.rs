@@ -146,6 +146,32 @@ pub enum ClientRequest {
     /// Returns `NodeResponse::CommunityPeers`.
     /// No authentication required — public DHT operation.
     FindCommunityPeers { community_pk: [u8; 32] },
+
+    /// Store a peer info record (x25519_pk + QUIC addr) keyed by `peer_id`.
+    ///
+    /// `peer_id`     = SHA-256 of the peer's Ed25519 verifying key.
+    /// `ed25519_pk`  = the full Ed25519 verifying key (allows receivers to check
+    ///                 SHA-256(ed25519_pk) == peer_id and verify the signature).
+    /// `sig`         = Ed25519 signature over `peer_id || x25519_pk` (64 bytes,
+    ///                 split into two 32-byte halves — same convention as Authenticate).
+    /// No authentication required — public DHT operation.
+    StorePeerInfo {
+        peer_id: [u8; 32],
+        ed25519_pk: [u8; 32],
+        x25519_pk: [u8; 32],
+        addr: NodeAddr,
+        display_name: String,
+        /// First 32 bytes of the Ed25519 signature over `peer_id || x25519_pk`.
+        sig_r: [u8; 32],
+        /// Last 32 bytes of the Ed25519 signature over `peer_id || x25519_pk`.
+        sig_s: [u8; 32],
+    },
+
+    /// Find peer info (x25519_pk + QUIC addr) for a given `peer_id`.
+    ///
+    /// Returns `NodeResponse::PeerInfo` if found, `NodeResponse::Error { 404 }` otherwise.
+    /// No authentication required — public DHT operation.
+    FindPeerInfo { peer_id: [u8; 32] },
 }
 
 // ── Node → Client (response) ─────────────────────────────────────────────────
@@ -201,6 +227,16 @@ pub enum NodeResponse {
 
     /// Known peers in a community (response to `FindCommunityPeers`).
     CommunityPeers(Vec<CommunityPeerRecord>),
+
+    /// Peer info (x25519_pk + QUIC addr + display name) returned for a `FindPeerInfo` query.
+    PeerInfo {
+        x25519_pk: [u8; 32],
+        addr: NodeAddr,
+        display_name: String,
+    },
+
+    /// Acknowledgement for `StorePeerInfo`.
+    PeerInfoAck,
 
     /// Error response; `code` mirrors HTTP semantics (400 = bad request, 403 = forbidden, …).
     Error { code: u16, msg: String },

@@ -1,6 +1,6 @@
 [package]
 name = "bitcord-tauri"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["BitCord Contributors"]
 description = "Tauri desktop application for the BitCord encrypted P2P communication platform"

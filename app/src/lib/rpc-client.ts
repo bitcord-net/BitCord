@@ -339,6 +339,10 @@ export class BitCordClient {
     this.call<string>("dm_set_preferred_mailbox_community", p);
   dmClearPreferredMailbox = () =>
     this.call<boolean>("dm_clear_preferred_mailbox");
+  dmDiscard = (peerId: string, messageId: string) =>
+    this.call<boolean>("dm_discard", { peer_id: peerId, message_id: messageId });
+  dmPeerName = (peerId: string) =>
+    this.call<string | null>("dm_peer_name", [peerId]);
 
   // Presence
   presenceHeartbeat = (p: PresenceHeartbeatParams) =>

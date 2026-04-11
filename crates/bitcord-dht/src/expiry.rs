@@ -20,13 +20,17 @@ pub fn spawn_expiry_task(state: Arc<DhtState>, store: Arc<DhtStore>) {
             loop {
                 interval.tick().await;
                 state_e.expire_records();
-                let cutoff = std::time::SystemTime::now()
+                let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs()
-                    .saturating_sub(crate::routing::COMMUNITY_PEER_TTL_SECS);
-                if let Err(e) = store_e.remove_expired_community_peers(cutoff) {
+                    .as_secs();
+                let peer_cutoff = now_secs.saturating_sub(crate::routing::COMMUNITY_PEER_TTL_SECS);
+                if let Err(e) = store_e.remove_expired_community_peers(peer_cutoff) {
                     warn!("failed to prune expired DHT community peers: {e}");
+                }
+                let info_cutoff = now_secs.saturating_sub(crate::routing::PEER_INFO_TTL_SECS);
+                if let Err(e) = store_e.remove_expired_peer_infos(info_cutoff) {
+                    warn!("failed to prune expired DHT peer info records: {e}");
                 }
             }
         });

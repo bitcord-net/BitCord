@@ -90,6 +90,12 @@ pub struct DmEventData {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DmSendFailedData {
+    pub peer_id: String,
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SeedStatusData {
     pub community_id: String,
     pub connected: bool,
@@ -123,6 +129,7 @@ pub enum PushEvent {
     NodeMetricsUpdated(MetricsSnapshot),
     SyncProgress(SyncProgressData),
     DmNew(DmEventData),
+    DmSendFailed(DmSendFailedData),
     ChannelHistorySynced(ChannelHistorySyncedData),
     ReactionUpdated(ReactionUpdatedData),
     SeedStatusChanged(SeedStatusData),

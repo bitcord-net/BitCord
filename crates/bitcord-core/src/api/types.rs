@@ -293,6 +293,12 @@ pub struct GetDmHistoryParams {
     pub limit: Option<u32>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscardDmParams {
+    pub peer_id: String,
+    pub message_id: String,
+}
+
 // ── Node ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -317,7 +323,6 @@ pub struct PeerSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeConfigDto {
     pub listen_addrs: Vec<String>,
-    pub seed_nodes: Vec<String>,
     pub max_connections: usize,
     pub storage_limit_mb: u64,
     pub bandwidth_limit_kbps: Option<u64>,
@@ -330,7 +335,6 @@ pub struct NodeConfigDto {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SetConfigParams {
     pub listen_addrs: Option<Vec<String>>,
-    pub seed_nodes: Option<Vec<String>>,
     pub max_connections: Option<usize>,
     pub storage_limit_mb: Option<u64>,
     pub bandwidth_limit_kbps: Option<Option<u64>>,

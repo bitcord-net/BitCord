@@ -19,5 +19,5 @@ pub mod store;
 
 pub use addr::NodeAddr;
 pub use expiry::spawn_expiry_task;
-pub use routing::{CommunityPeerRecord, DhtState, NodeId};
+pub use routing::{CommunityPeerRecord, DhtState, NodeId, PeerInfoRecord};
 pub use store::DhtStore;

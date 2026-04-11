@@ -148,10 +148,10 @@ impl NodeServer {
                 match incoming.await {
                     Ok(conn) => {
                         let remote = conn.remote_address();
-                        info!(%remote, "QUIC client connected");
+                        info!(%remote, "peer connected");
                         let handler = ConnectionHandler::new(conn, services);
                         handler.run().await;
-                        info!(%remote, "QUIC client disconnected");
+                        info!(%remote, "peer disconnected");
                     }
                     Err(e) => {
                         warn!("QUIC incoming connection failed: {e}");

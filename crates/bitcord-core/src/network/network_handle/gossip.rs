@@ -50,13 +50,23 @@ pub(super) async fn gossip_task(
     // Channel for gossip events received from remote peer nodes.
     let (gossip_evt_tx, mut gossip_evt_rx) = mpsc::channel::<NetworkEvent>(512);
 
-    // Active peer connections: peer_id → NodeClient.
+    // Active peer connections: raw_node_pk_hex → NodeClient.
     let mut peers: HashMap<String, crate::network::client::NodeClient> = HashMap::new();
+
+    // Reverse index: SHA256(node_pk)_hex → raw_node_pk_hex.
+    // Needed so SendDm can find connected peers by their application-layer peer_id.
+    let mut sha256_map: HashMap<String, String> = HashMap::new();
 
     // Seed peer addresses for auto-reconnect: peer_id → (NodeAddr, Option<(community_pk, community_id)>).
     // When a seed peer drops, we spawn a reconnect loop so the embedded node
     // stays connected to always-on infrastructure.
     let mut seed_peers: HashMap<String, SeedPeerInfo> = HashMap::new();
+
+    // Cancel senders for active seed reconnect loops, keyed by addr string.
+    // When a seed peer drops, its cancel sender is stored here so the reconnect
+    // loop can be stopped if needed in the future.
+    let mut seed_reconnect_cancels: HashMap<String, tokio::sync::oneshot::Sender<()>> =
+        HashMap::new();
 
     // ── Inbound gossip relay task ─────────────────────────────────────────────
     // Subscribes to our own NodeServer's push channel to see gossip from
@@ -121,7 +131,9 @@ pub(super) async fn gossip_task(
                 if !handle_command(
                     cmd,
                     &mut peers,
+                    &mut sha256_map,
                     &mut seed_peers,
+                    &mut seed_reconnect_cancels,
                     &identity,
                     &peer_reg_tx,
                     &gossip_evt_tx,
@@ -141,6 +153,24 @@ pub(super) async fn gossip_task(
                     if let std::collections::hash_map::Entry::Vacant(e) =
                         peers.entry(reg.peer_id.clone())
                     {
+                        // Seed the DHT routing table with this peer's address.
+                        let _ = evt_tx
+                            .send(NetworkEvent::PeerAddrKnown {
+                                node_pk: reg.node_pk,
+                                addr: reg.addr.clone(),
+                            })
+                            .await;
+
+                        // Index SHA256(node_pk) → raw_pk_hex so SendDm can find
+                        // connected peers when given an application-layer peer_id.
+                        {
+                            use sha2::{Digest, Sha256};
+                            let sha256: [u8; 32] = Sha256::digest(reg.node_pk).into();
+                            let sha256_hex: String =
+                                sha256.iter().map(|b| format!("{b:02x}")).collect();
+                            sha256_map.insert(sha256_hex, reg.peer_id.clone());
+                        }
+
                         // Spawn push_reader only for the first connection per peer.
                         tokio::spawn(push_reader(
                             reg.push_rx,
