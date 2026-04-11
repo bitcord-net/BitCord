@@ -143,18 +143,6 @@ function SeedNodesTab({ community }: { community: CommunityInfo }) {
       await rpcClient.communityUpdateManifest({ community_id: community.id, seed_nodes });
       updateCommunity({ ...community, seed_nodes });
 
-      // Also add to local node's seed peers so we dial it immediately
-      if (seedNode.trim()) {
-        try {
-          const cfg = await rpcClient.nodeGetConfig();
-          if (!cfg.seed_nodes.includes(seedNode.trim())) {
-            await rpcClient.nodeSetConfig({ seed_nodes: [...cfg.seed_nodes, seedNode.trim()] });
-          }
-        } catch {
-          // Non-fatal
-        }
-      }
-
       toast("Seed node updated.");
     } catch {
       setError("Failed to update seed node.");
