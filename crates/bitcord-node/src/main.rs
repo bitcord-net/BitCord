@@ -52,7 +52,8 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     api_bind: std::net::IpAddr,
 
-    /// UDP port for the QUIC transport server (0 = use config value)
+    /// UDP port for the QUIC transport server.
+    /// 0 = use the value from the config file, or 9042 if unconfigured.
     #[arg(long, default_value = "0")]
     quic_port: u16,
 
@@ -97,15 +98,19 @@ async fn main() -> Result<()> {
     }
 
     // ── Init tracing ──────────────────────────────────────────────────────────
+    // `mdns_sd` logs at ERROR when an mDNS response has no matching address
+    // family on an interface (e.g. an IPv6-only NIC receiving TYPE_A records).
+    // This is harmless and very noisy on headless nodes, so silence it while
+    // keeping the configured global level.
+    let env_filter = tracing_subscriber::EnvFilter::new(&config.log_level)
+        .add_directive("mdns_sd=off".parse().expect("valid filter directive"));
     if std::env::var("BITCORD_TEST_MODE").is_ok() {
         tracing_subscriber::fmt()
             .json()
-            .with_env_filter(&config.log_level)
+            .with_env_filter(env_filter)
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(&config.log_level)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     info!(
