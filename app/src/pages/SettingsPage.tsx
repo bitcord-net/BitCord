@@ -167,19 +167,26 @@ function AccountTab() {
     }
   }
 
-  async function exportIdentity() {
+  const [showExportPrompt, setShowExportPrompt] = useState(false);
+  const [exportPass, setExportPass] = useState("");
+  const [exportError, setExportError] = useState("");
+  const [exporting, setExporting] = useState(false);
+
+  async function doExportIdentity() {
+    setExportError("");
+    if (exportPass.length < 8) { setExportError("Export passphrase must be at least 8 characters"); return; }
+    setExporting(true);
     try {
-      // Export as identity info JSON (no private keys)
-      const data = JSON.stringify({ peer_id: identity?.peer_id, display_name: identity?.display_name, exported_at: new Date().toISOString() }, null, 2);
-      const blob = new Blob([data], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `bitcord-identity-${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch {
-      // noop
+      // Rust side opens a native save dialog and writes the file directly.
+      await invoke("export_identity", { exportPassphrase: exportPass });
+      setExportPass("");
+      setShowExportPrompt(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === "string" ? e : "Export failed";
+      // User cancelled the save dialog — not an error worth showing.
+      if (msg !== "no file selected") setExportError(msg);
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -217,7 +224,32 @@ function AccountTab() {
       </div>
 
       <div style={{ marginBottom: 24 }}>
-        <Btn variant="ghost" onClick={exportIdentity}>Export Identity Backup</Btn>
+        <SectionHeader>Identity Sharing</SectionHeader>
+        <div style={{ fontSize: 13, color: "var(--color-bc-muted)", marginBottom: 10 }}>
+          Export your identity to use the same account on another device. The export file is encrypted with a passphrase you choose.
+        </div>
+        {!showExportPrompt ? (
+          <Btn variant="ghost" onClick={() => { setShowExportPrompt(true); setExportError(""); setExportPass(""); }}>Export Identity</Btn>
+        ) : (
+          <div style={{ padding: "12px 0" }}>
+            <div style={{ fontSize: 13, color: "var(--color-bc-muted)", marginBottom: 8 }}>
+              Choose an export passphrase to encrypt the identity file:
+            </div>
+            <input
+              type="password"
+              value={exportPass}
+              onChange={(e) => { setExportPass(e.target.value); setExportError(""); }}
+              placeholder="Export passphrase (min 8 chars)"
+              autoFocus
+              style={{ display: "block", width: "100%", background: "var(--color-bc-surface-3)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 4, padding: "8px 10px", color: "var(--color-bc-text)", fontSize: 14, outline: "none", boxSizing: "border-box" }}
+            />
+            {exportError && <div style={{ color: "var(--color-bc-danger)", fontSize: 13, marginTop: 4 }}>{exportError}</div>}
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <Btn onClick={doExportIdentity} disabled={exporting}>{exporting ? "Exporting…" : "Export & Download"}</Btn>
+              <Btn variant="ghost" onClick={() => setShowExportPrompt(false)}>Cancel</Btn>
+            </div>
+          </div>
+        )}
       </div>
 
       <SectionHeader>Change Passphrase</SectionHeader>

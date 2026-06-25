@@ -30,6 +30,7 @@ directories = "5"
 ulid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bs58 = "0.5"
+base64 = "0.22"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 postcard = { version = "1", features = ["alloc"] }
 tauri-plugin-single-instance = "2.4.0"

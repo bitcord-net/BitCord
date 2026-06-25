@@ -19,7 +19,7 @@ use bitcord_core::{
     },
     config::NodeConfig,
     crypto::dm::DmEnvelope,
-    identity::{NodeIdentity, keystore::KeyStore},
+    identity::{NodeIdentity, export::IdentityExport, keystore::KeyStore},
     network::{NodeAddr, client::NodeClient, protocol::NodePush},
     node::{NodeInitConfig, init_node, store::NodeStore},
 };
@@ -153,6 +153,38 @@ async fn pick_file(app: AppHandle) -> Result<String, String> {
         .map_err(|_| "Dialog closed unexpectedly".to_string())?
         .map(|p| p.to_string())
         .ok_or_else(|| "No file selected".to_string())
+}
+
+/// Open a native file picker, read the selected file, and return its contents
+/// as a Base64-encoded string together with the file path.
+///
+/// Returns `{ path, data_b64 }`, or an error if the user cancels or the file
+/// cannot be read.  Using this instead of fetching via the asset:// protocol
+/// avoids URL-encoding issues with special characters in file paths.
+#[tauri::command]
+async fn pick_and_read_file(app: AppHandle) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("BitCord Identity", &["bcid"])
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+
+    let file_path = rx
+        .await
+        .map_err(|_| "Dialog closed unexpectedly".to_string())?
+        .ok_or_else(|| "No file selected".to_string())?;
+
+    let path = file_path.as_path().ok_or("invalid file path")?;
+    let bytes = std::fs::read(path).map_err(|e| format!("failed to read file: {e}"))?;
+    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+
+    Ok(serde_json::json!({
+        "path": file_path.to_string(),
+        "data_b64": data_b64,
+    }))
 }
 
 // ── Backend initialisation ────────────────────────────────────────────────────
@@ -697,6 +729,123 @@ fn show_window(app: &AppHandle) {
     }
 }
 
+/// Export the current identity as a passphrase-encrypted `.bcid` bundle.
+///
+/// Opens a native save-file dialog, then writes the bundle to the chosen path.
+/// The export passphrase is independent from the device's local keystore
+/// passphrase — choose one that is safe to type on other devices.
+///
+/// Only available after the backend has been started (`NodeState` managed).
+#[tauri::command]
+async fn export_identity(
+    app: AppHandle,
+    export_passphrase: String,
+) -> Result<(), String> {
+    if export_passphrase.len() < 8 {
+        return Err("export passphrase must be at least 8 characters".into());
+    }
+
+    let state = app
+        .try_state::<commands::NodeState>()
+        .ok_or("backend is not running")?;
+
+    let identity = &state.identity;
+    let display_name: Option<String> = {
+        let config_path = get_config_path(&app);
+        NodeConfig::load_or_default(&config_path)
+            .unwrap_or_default()
+            .display_name
+    };
+
+    let bundle = IdentityExport::create(
+        identity,
+        display_name.as_deref(),
+        &export_passphrase,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Open a native save-file dialog and write the bundle to the chosen path.
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("BitCord Identity", &["bcid"])
+        .set_file_name("bitcord-identity.bcid")
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+
+    let save_path = rx
+        .await
+        .map_err(|_| "dialog closed unexpectedly".to_string())?
+        .ok_or_else(|| "no file selected".to_string())?;
+
+    let path = save_path
+        .as_path()
+        .ok_or("invalid save path")?;
+
+    std::fs::write(path, &bundle).map_err(|e| format!("failed to write file: {e}"))?;
+
+    Ok(())
+}
+
+/// Import a `.bcid` identity bundle on a new device.
+///
+/// Decrypts the bundle with `export_passphrase`, re-encrypts the signing key
+/// with `local_passphrase`, saves the keystore, updates the config, and starts
+/// the backend — exactly like `create_identity` but using an existing keypair.
+///
+/// `display_name` overrides the name embedded in the bundle if non-empty.
+#[tauri::command]
+async fn import_identity(
+    app: AppHandle,
+    bundle_b64: String,
+    export_passphrase: String,
+    local_passphrase: String,
+    display_name: String,
+    save_passphrase: bool,
+) -> Result<(), String> {
+    if local_passphrase.len() < 8 {
+        return Err("local passphrase must be at least 8 characters".into());
+    }
+
+    let bundle = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        bundle_b64.trim(),
+    )
+    .map_err(|_| "invalid bundle encoding")?;
+
+    let (identity, embedded_name) =
+        IdentityExport::load(&bundle, &export_passphrase).map_err(|e| e.to_string())?;
+
+    let config_path = get_config_path(&app);
+    let mut config = NodeConfig::load_or_default(&config_path).map_err(|e| e.to_string())?;
+
+    // Persist identity to the local keystore under the device's own passphrase.
+    KeyStore::save(&config.identity_path, &identity, &local_passphrase)
+        .map_err(|e| format!("failed to save imported identity: {e}"))?;
+
+    // Prefer the caller-supplied display name; fall back to embedded name.
+    let final_name = if display_name.trim().is_empty() {
+        embedded_name.unwrap_or_default()
+    } else {
+        display_name.trim().to_owned()
+    };
+    if !final_name.is_empty() {
+        config.display_name = Some(final_name);
+    }
+    config.save_passphrase = save_passphrase;
+    let _ = config.save(&config_path);
+
+    start_backend_with_passphrase(app.clone(), &local_passphrase)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    handle_save_passphrase(&app, &local_passphrase, save_passphrase).await;
+
+    Ok(())
+}
+
 // ── App entry point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -789,10 +938,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_backend_status,
             pick_file,
+            pick_and_read_file,
             unlock_identity,
             create_identity,
             get_save_passphrase,
             set_save_passphrase,
+            export_identity,
+            import_identity,
             commands::node_send_message,
             commands::node_get_messages,
             commands::node_send_dm,

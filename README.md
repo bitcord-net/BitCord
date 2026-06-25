@@ -15,9 +15,9 @@ BitCord is an encrypted, peer-to-peer communication platform designed as a priva
 *   **DHT Community Peer Discovery:** Both seeded and seedless communities use a Kademlia DHT to discover and connect to peers directly. On join or create, each node announces its presence to the DHT and runs an iterative lookup to find and dial other community members.
 *   **Invite System:** Secure community discovery using Base64URL-encoded invite links that bundle community metadata, connection information, and TLS certificate fingerprints for certificate pinning.
 *   **Roles and Permissions:** Community members can be assigned roles (Admin or Moderator) that grant moderation privileges. See the [Roles and Permissions](#roles-and-permissions) section for details.
+*   **Identity Sharing**: Export your identity to an encrypted `.bcid` file and import it on another device. Both devices operate simultaneously with the same peer ID.
 
 ## Planned Features
-*   **Identity Sharing**: Share your ID across devices.
 *   **Better Android Support**: While the mobile build works, it needs UI/UX improvements.
 *   **Custom Emoji:** Support for community-specific reaction and message emojis.
 *   **GIF Integration:** Built-in support for searching and sharing animated GIFs.

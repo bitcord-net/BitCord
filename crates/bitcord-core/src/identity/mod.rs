@@ -5,6 +5,7 @@ use std::fmt;
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroize;
 
+pub mod export;
 pub mod keystore;
 
 pub use ed25519_dalek::{Signature, SigningKey, VerifyingKey};

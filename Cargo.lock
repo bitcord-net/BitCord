@@ -510,6 +510,7 @@ name = "bitcord-tauri"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bitcord-core",
  "bs58",
  "chrono",
