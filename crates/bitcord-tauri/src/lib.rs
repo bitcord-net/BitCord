@@ -737,10 +737,7 @@ fn show_window(app: &AppHandle) {
 ///
 /// Only available after the backend has been started (`NodeState` managed).
 #[tauri::command]
-async fn export_identity(
-    app: AppHandle,
-    export_passphrase: String,
-) -> Result<(), String> {
+async fn export_identity(app: AppHandle, export_passphrase: String) -> Result<(), String> {
     if export_passphrase.len() < 8 {
         return Err("export passphrase must be at least 8 characters".into());
     }
@@ -757,12 +754,8 @@ async fn export_identity(
             .display_name
     };
 
-    let bundle = IdentityExport::create(
-        identity,
-        display_name.as_deref(),
-        &export_passphrase,
-    )
-    .map_err(|e| e.to_string())?;
+    let bundle = IdentityExport::create(identity, display_name.as_deref(), &export_passphrase)
+        .map_err(|e| e.to_string())?;
 
     // Open a native save-file dialog and write the bundle to the chosen path.
     use tauri_plugin_dialog::DialogExt;
@@ -780,9 +773,7 @@ async fn export_identity(
         .map_err(|_| "dialog closed unexpectedly".to_string())?
         .ok_or_else(|| "no file selected".to_string())?;
 
-    let path = save_path
-        .as_path()
-        .ok_or("invalid save path")?;
+    let path = save_path.as_path().ok_or("invalid save path")?;
 
     std::fs::write(path, &bundle).map_err(|e| format!("failed to write file: {e}"))?;
 

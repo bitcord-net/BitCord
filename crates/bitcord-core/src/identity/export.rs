@@ -15,9 +15,12 @@
 //! passphrase produces a decryption error; the format is self-contained and
 //! does **not** rely on the local device's keystore file.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use rand::{RngCore, rngs::OsRng};
 use zeroize::Zeroize;
 
@@ -122,8 +125,7 @@ fn encrypt_signing_key(identity: &NodeIdentity, passphrase: &str) -> anyhow::Res
     let mut okm = [0u8; 32];
     derive_key(passphrase, &salt, &mut okm);
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&okm)
-        .context("failed to create cipher")?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&okm).context("failed to create cipher")?;
     okm.zeroize();
 
     let nonce = XNonce::from_slice(&nonce_bytes);
@@ -152,8 +154,7 @@ fn decrypt_signing_key(blob: &[u8], passphrase: &str) -> anyhow::Result<NodeIden
     let mut okm = [0u8; 32];
     derive_key(passphrase, salt, &mut okm);
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&okm)
-        .context("failed to create cipher")?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&okm).context("failed to create cipher")?;
     okm.zeroize();
 
     let nonce = XNonce::from_slice(nonce_bytes);
