@@ -306,7 +306,7 @@ impl DhtState {
                 announced_at: now,
             });
             if list.len() > K {
-                list.sort_by(|a, b| b.announced_at.cmp(&a.announced_at));
+                list.sort_by_key(|b| std::cmp::Reverse(b.announced_at));
                 list.truncate(K);
             }
         }
