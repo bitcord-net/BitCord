@@ -828,7 +828,7 @@ function AboutTab() {
   const identity = useIdentityStore((s) => s.identity);
   const { copied, copy } = useCopyText();
   const BUILD_COMMIT = import.meta.env.VITE_BUILD_COMMIT ?? "development";
-  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.3.0";
+  const APP_VERSION = import.meta.env.VITE_APP_VERSION ?? "0.4.0";
 
   return (
     <div>
